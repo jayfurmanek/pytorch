@@ -763,7 +763,43 @@ PyObject* THCPModule_attachOutOfMemoryObserver(
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THCPModule_cudaSetSyncDebugMode(PyObject* _unused, PyObject* arg) {
+PyObject* THCPModule_setUserEnabledUVM(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(PyBool_Check(arg), "set_enabled_uvm expects a bool, "
+          "but got %s", THPUtils_typename(arg));
+  at::globalContext().setUserEnabledUVM(arg == Py_True);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_userEnabledUVM(PyObject *_unused, PyObject *noargs)
+{
+  HANDLE_TH_ERRORS
+  if (at::globalContext().userEnabledUVM()) Py_RETURN_TRUE;
+  else Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_setUserEnabledMove(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(PyBool_Check(arg), "set_enabled_move expects a bool, "
+          "but got %s", THPUtils_typename(arg));
+  at::globalContext().setUserEnabledMove(arg == Py_True);
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_userEnabledMove(PyObject *_unused, PyObject *noargs)
+{
+  HANDLE_TH_ERRORS
+  if (at::globalContext().userEnabledMove()) Py_RETURN_TRUE;
+  else Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_cudaSetSyncDebugMode(PyObject * _unused, PyObject * arg){
   HANDLE_TH_ERRORS
   TORCH_WARN_ONCE(
       "Synchronization debug mode is a prototype feature and does not yet detect all "
@@ -1169,6 +1205,10 @@ static struct PyMethodDef _THCPModule_methods[] = {
      THCPModule_attachOutOfMemoryObserver,
      METH_O,
      nullptr},
+    {"_cuda_getEnabledUVM", THCPModule_userEnabledUVM, METH_NOARGS, nullptr},
+    {"_cuda_setEnabledUVM", THCPModule_setUserEnabledUVM, METH_O,   nullptr},
+    {"_cuda_getEnabledMove", THCPModule_userEnabledMove, METH_NOARGS, nullptr},
+    {"_cuda_setEnabledMove", THCPModule_setUserEnabledMove, METH_O,   nullptr},
     {"_cuda_cudaHostAllocator",
      THCPModule_cudaHostAllocator,
      METH_NOARGS,
