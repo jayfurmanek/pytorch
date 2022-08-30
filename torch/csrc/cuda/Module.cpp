@@ -531,9 +531,61 @@ PyObject* THCPModule_memoryStats(PyObject* _unused, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
-PyObject* THCPModule_resetAccumulatedMemoryStats(
-    PyObject* _unused,
-    PyObject* arg) {
+PyObject* THCPModule_managedMemoryStats(PyObject *_unused, PyObject *arg)
+{
+  HANDLE_TH_ERRORS
+  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to memory_allocated");
+  const int device = (int) THPUtils_unpackLong(arg);
+
+  using at::cuda::CachingManagedAllocator::StatType;
+  using at::cuda::CachingManagedAllocator::Stat;
+  using at::cuda::CachingManagedAllocator::StatArray;
+  using at::cuda::CachingManagedAllocator::DeviceStats;
+
+  const auto statToDict = [](const Stat& stat) {
+    py::dict dict;
+
+    dict["current"] = stat.current;
+    dict["peak"] = stat.peak;
+    dict["allocated"] = stat.allocated;
+    dict["freed"] = stat.freed;
+    return dict;
+  };
+
+  const auto statArrayToDict = [=](const StatArray& statArray) {
+    const std::array<const char*, static_cast<size_t>(StatType::NUM_TYPES)> statTypeNames = {
+      "all", "small_pool", "large_pool"
+    };
+    py::dict dict;
+    for (const auto i : c10::irange(statTypeNames.size())) {
+      dict[statTypeNames[i]] = statToDict(statArray[i]);
+    }
+    return dict;
+  };
+
+  const DeviceStats stats = at::cuda::CachingManagedAllocator::getDeviceStats();
+
+  py::dict result;
+  result["num_alloc_retries"] = stats.num_alloc_retries;
+  result["num_ooms"] = stats.num_ooms;
+  result["max_split_size"] = stats.max_split_size;
+  result["allocation"] = statArrayToDict(stats.allocation);
+  result["segment"] = statArrayToDict(stats.segment);
+  result["active"] = statArrayToDict(stats.active);
+  result["inactive_split"] = statArrayToDict(stats.inactive_split);
+  result["allocated_bytes"] = statArrayToDict(stats.allocated_bytes);
+  result["reserved_bytes"] = statArrayToDict(stats.reserved_bytes);
+  result["active_bytes"] = statArrayToDict(stats.active_bytes);
+  result["inactive_split_bytes"] = statArrayToDict(stats.inactive_split_bytes);
+  result["oversize_allocations"] = statToDict(stats.oversize_allocations);
+  result["oversize_segments"] = statToDict(stats.oversize_segments);
+
+  return result.release().ptr();
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THCPModule_resetAccumulatedMemoryStats(PyObject *_unused, PyObject *arg)
+{
   HANDLE_TH_ERRORS
   THPUtils_assert(
       THPUtils_checkLong(arg),
@@ -1209,6 +1261,7 @@ static struct PyMethodDef _THCPModule_methods[] = {
      nullptr},
     {"_cuda_emptyCache", THCPModule_emptyCache, METH_NOARGS, nullptr},
     {"_cuda_memoryStats", THCPModule_memoryStats, METH_O, nullptr},
+    {"_cuda_managedMemoryStats", THCPModule_managedMemoryStats, METH_O, nullptr},
     {"_cuda_resetAccumulatedMemoryStats",
      THCPModule_resetAccumulatedMemoryStats,
      METH_O,
