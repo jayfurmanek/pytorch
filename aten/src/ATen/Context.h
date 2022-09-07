@@ -55,6 +55,9 @@ class TORCH_API Context {
   static bool isPinnedPtr(void* data) {
     return detail::getCUDAHooks().isPinnedPtr(data);
   }
+  static bool isManagedPtr(void* data) {
+    return detail::getCUDAHooks().isManagedPtr(data);
+  }
   static bool hasOpenMP();
   static bool hasMKL();
   static bool hasLAPACK();

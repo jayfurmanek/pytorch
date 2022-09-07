@@ -91,6 +91,19 @@ static PyObject* THPStorage_isPinned(PyObject* _self, PyObject* noargs) {
   END_HANDLE_TH_ERRORS
 }
 
+static PyObject* THPStorage_isManaged(PyObject* _self, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+  auto self = (THPStorage*)_self;
+#if defined(USE_CUDA)
+  return PyBool_FromLong(
+      at::globalContext().isManagedPtr(self->cdata->data<scalar_t>()));
+#else
+  Py_RETURN_FALSE;
+#endif
+  END_HANDLE_TH_ERRORS
+}
+
+
 static PyObject* THPStorage_elementSize(PyObject* _self, PyObject* noargs) {
   HANDLE_TH_ERRORS
   return THPUtils_packInt64(sizeof(uint8_t));
@@ -502,6 +515,7 @@ static PyMethodDef THPStorage_methods[] = {
     {"nbytes", THPStorage_nbytes, METH_NOARGS, nullptr},
     {"data_ptr", THPStorage_dataPtr, METH_NOARGS, nullptr},
     {"is_pinned", THPStorage_isPinned, METH_NOARGS, nullptr},
+    {"is_managed", THPStorage_isManaged, METH_NOARGS, nullptr},
     {"_write_file", THPStorage_writeFile, METH_VARARGS, nullptr},
     {"_new_with_file",
      THPStorage_newWithFile,

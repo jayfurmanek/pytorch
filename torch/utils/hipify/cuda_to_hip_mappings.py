@@ -4069,6 +4069,7 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict(
         ("cudaHostAlloc", ("hipHostMalloc", CONV_MEM, API_RUNTIME)),
         ("cudaMemoryTypeHost", ("hipMemoryTypeHost", CONV_MEM, API_RUNTIME)),
         ("cudaMemoryTypeDevice", ("hipMemoryTypeDevice", CONV_MEM, API_RUNTIME)),
+        ("cudaMemoryTypeManaged", ("hipMemoryTypeUnified", CONV_MEM, API_RUNTIME)),
         ("make_cudaExtent", ("make_hipExtent", CONV_MEM, API_RUNTIME)),
         ("make_cudaPitchedPtr", ("make_hipPitchedPtr", CONV_MEM, API_RUNTIME)),
         ("make_cudaPos", ("make_hipPos", CONV_MEM, API_RUNTIME)),

@@ -115,7 +115,9 @@ inline Tensor new_qtensor(
   auto device = options.device();
   at::Allocator* allocator = nullptr;
   // TODO: why isn't this just using GetAllocator
-  if (device.is_cuda()) {
+  if (at::globalContext().userEnabledUVM()) {
+    allocator = at::detail::getCUDAHooks().getUnifiedDeviceAllocator();
+  } else if (device.is_cuda()) {
     allocator = at::detail::getCUDAHooks().getCUDADeviceAllocator();
   } else if (device.is_cpu()) {
     allocator = at::getCPUAllocator();

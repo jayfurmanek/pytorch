@@ -37,6 +37,15 @@ def _host_allocator():
     _lazy_init()
     return torch._C._cuda_cudaHostAllocator()
 
+def _manage_allocator():
+    _lazy_init()
+    return torch._C._cuda_cudaUnifiedDeviceAllocator()
+
+
+def _manage_cpu_allocator():
+    _lazy_init()
+    return torch._C._cuda_cudaUnifiedDeviceAllocatorCpu()
+
 
 @contextlib.contextmanager
 def _free_mutex():
