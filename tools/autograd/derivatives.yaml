@@ -420,6 +420,13 @@
   # (If dtype IS nullopt, we rely on the regular check that any input requires grad).
   output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]
 
+- name: _to_move(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, bool non_blocking=False, MemoryFormat? memory_format=None) -> Tensor
+  self: _to_move_backward(grad, self.options())
+  result: _to_move(self_t, dtype, layout, device, pin_memory, non_blocking, memory_format)
+  # The condition is: if dtype is not nullopt, then isDifferentiableType(*dtype)
+  # (If dtype IS nullopt, we rely on the regular check that any input requires grad).
+  output_differentiability: ["!dtype || isDifferentiableType(*dtype)"]
+
 - name: _coalesce(Tensor self) -> Tensor
   self: grad
 
