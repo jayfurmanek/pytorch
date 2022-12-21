@@ -64,6 +64,7 @@ FUNCTIONAL_OPS_THAT_CANNOT_GET_AN_OUT_VARIANT = [
     "equal",  # returns a boolean
     "is_coalesced",  # returns an boolean
     "is_pinned",  # returns a boolean
+    "is_managed",
     "is_same_size",  # returns a boolean
     "is_set_to",  # returns a boolean
     "q_per_channel_axis",  # returns an int

@@ -8,6 +8,7 @@
 #else
 #include <ATen/ops/_debug_has_internal_overlap_native.h>
 #include <ATen/ops/_pin_memory.h>
+#include <ATen/ops/_manage_memory.h>
 #include <ATen/ops/is_pinned_native.h>
 #include <ATen/ops/pin_memory_native.h>
 #endif

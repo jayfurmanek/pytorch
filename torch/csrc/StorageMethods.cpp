@@ -96,7 +96,7 @@ static PyObject* THPStorage_isManaged(PyObject* _self, PyObject* noargs) {
   auto self = (THPStorage*)_self;
 #if defined(USE_CUDA)
   return PyBool_FromLong(
-      at::globalContext().isManagedPtr(self->cdata->data<scalar_t>()));
+      at::globalContext().isManagedPtr(self->cdata->data<uint8_t>()));
 #else
   Py_RETURN_FALSE;
 #endif

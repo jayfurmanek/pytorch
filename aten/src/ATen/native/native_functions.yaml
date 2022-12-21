@@ -1632,7 +1632,7 @@
   device_guard: False
   dispatch:
     CompositeExplicitAutograd: move_
-  autogen: move.functional, move.out
+  autogen: move, move.out
 
 - func: _copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
   dispatch:
