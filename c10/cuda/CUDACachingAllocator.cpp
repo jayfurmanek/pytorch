@@ -628,7 +628,7 @@ size_t CachingAllocatorConfig::parseAllocatorConfig(
   consumeToken(config, ++i, ':');
   if (++i < config.size()) {
     TORCH_CHECK(
-        ((config[i] == "native") || (config[i] == "cudaMallocAsync")),
+        ((config[i] == "native") || (config[i] == "cudaMallocAsync") || (config[i] == "cudaMallocManaged")),
         "Unknown allocator backend, "
         "options are native and cudaMallocAsync");
     used_cudaMallocAsync = (config[i] == "cudaMallocAsync");
@@ -2336,6 +2336,12 @@ CUDAAllocator* allocator();
 
 } // namespace CudaMallocAsync
 
+namespace CudaMallocManaged {
+// If this is put in its own header file, it gets incorrectly renamed in HIPify.
+CUDAAllocator* allocator();
+
+} // namespace CudaMallocManaged
+
 struct BackendStaticInitializer {
   // Parses env for backend at load time, duplicating some logic from
   // CachingAllocatorConfig. CachingAllocatorConfig double-checks it later (at
@@ -2361,6 +2367,8 @@ struct BackendStaticInitializer {
           if (kv[0] == "backend") {
             if (kv[1] == "cudaMallocAsync")
               return CudaMallocAsync::allocator();
+            if (kv[1] == "cudaMallocManaged")
+              return CudaMallocManaged::allocator();
             if (kv[1] == "native")
               return &Native::allocator;
           }

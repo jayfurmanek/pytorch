@@ -25,6 +25,7 @@ set(C10_CUDA_SRCS
     CUDAException.cpp
     CUDAFunctions.cpp
     CUDAMallocAsyncAllocator.cpp
+    CUDAMallocManagedAllocator.cpp
     CUDAMiscFunctions.cpp
     CUDAStream.cpp
     impl/CUDAGuardImpl.cpp
