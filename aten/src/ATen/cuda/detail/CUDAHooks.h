@@ -36,8 +36,6 @@ struct CUDAHooks : public at::CUDAHooksInterface {
   bool hasPrimaryContext(int64_t device_index) const override;
   Allocator* getCUDADeviceAllocator() const override;
   Allocator* getPinnedMemoryAllocator() const override;
-  Allocator* getUnifiedDeviceAllocator() const override;
-  Allocator* getUnifiedDeviceAllocatorCpu() const override;
   bool compiledWithCuDNN() const override;
   bool compiledWithMIOpen() const override;
   bool supportsDilatedConvolutionWithCuDNN() const override;

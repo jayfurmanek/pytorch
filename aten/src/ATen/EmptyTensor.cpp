@@ -14,7 +14,7 @@ c10::Allocator* GetCPUAllocatorMaybePinned(bool pin_memory) {
   if (at::globalContext().userEnabledUVM()) {
     // When UVM is enabled, we only use a single allocator
     // for all allocations.
-    return detail::getCUDAHooks().getUnifiedDeviceAllocatorCpu();
+    return detail::getCUDAHooks().getCUDADeviceAllocator();
   }
   else {
     if (pin_memory) {

@@ -292,14 +292,6 @@ Allocator* CUDAHooks::getCUDADeviceAllocator() const {
   return at::cuda::getCUDADeviceAllocator();
 }
 
-Allocator* CUDAHooks::getUnifiedDeviceAllocator() const {
-  return at::cuda::getUnifiedDeviceAllocator();
-}
-
-Allocator* CUDAHooks::getUnifiedDeviceAllocatorCpu() const {
-  return at::cuda::getUnifiedDeviceAllocatorCpu();
-}
-
 bool CUDAHooks::compiledWithCuDNN() const {
   return AT_CUDNN_ENABLED();
 }

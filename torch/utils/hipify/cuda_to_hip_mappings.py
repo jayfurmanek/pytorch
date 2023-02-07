@@ -4061,6 +4061,36 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict(
             ("hipMallocMipmappedArray", CONV_MEM, API_RUNTIME, HIP_UNSUPPORTED),
         ),
         ("cudaMallocPitch", ("hipMallocPitch", CONV_MEM, API_RUNTIME)),
+        ("cudaMemPool_t", ("hipMemPool_t", CONV_MEM, API_RUNTIME)),
+        ("cudaMemPoolTrimTo", ("hipMemPoolTrimTo", CONV_MEM, API_RUNTIME)),
+        (
+            "cudaDeviceGetDefaultMemPool",
+            ("hipDeviceGetDefaultMemPool", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolGetAttribute",
+            ("hipMemPoolGetAttribute", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolAttrUsedMemHigh",
+            ("hipMemPoolAttrUsedMemHigh", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolSetAttribute",
+            ("hipMemPoolSetAttribute", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolAttrReservedMemHigh",
+            ("hipMemPoolAttrReservedMemHigh", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolAttrReservedMemCurrent",
+            ("hipMemPoolAttrReservedMemCurrent", CONV_MEM, API_RUNTIME)
+        ),
+        (
+            "cudaMemPoolAttrUsedMemCurrent",
+            ("hipMemPoolAttrUsedMemCurrent", CONV_MEM, API_RUNTIME)
+        ),
         ("cudaFreeHost", ("hipHostFree", CONV_MEM, API_RUNTIME)),
         ("cudaFreeArray", ("hipFreeArray", CONV_MEM, API_RUNTIME)),
         ("cudaFree", ("hipFree", CONV_MEM, API_RUNTIME)),

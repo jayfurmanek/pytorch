@@ -21,12 +21,8 @@ bool is_managed_cuda(const Tensor& self, c10::optional<Device> device) {
 Tensor _manage_memory_cuda(const Tensor& self, c10::optional<Device> device) {
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
       (!device.has_value() && device->is_cpu()) || device->is_cuda());
-  at::Allocator* allocator = nullptr;
-  if (self.is_cpu()) {
-    allocator = at::cuda::getUnifiedDeviceAllocatorCpu();
-  } else if (self.is_cuda()) {
-    allocator = at::cuda::getUnifiedDeviceAllocator();
-  }
+  at::Allocator* allocator = at::detail::getCUDAHooks().getCUDADeviceAllocator();
+
   size_t size_bytes = detail::computeStorageNbytes(
       self.sizes(), self.strides(), self.dtype().itemsize());
   auto storage = Storage(

@@ -135,14 +135,6 @@ struct TORCH_API CUDAHooksInterface {
     TORCH_CHECK(false, "CUDADeviceAllocator requires CUDA. ", CUDA_HELP);
   }
 
-  virtual Allocator* getUnifiedDeviceAllocator() const {
-    TORCH_CHECK(false, "Unified Device Allocator requires CUDA. ", CUDA_HELP);
-  }
-
-  virtual Allocator* getUnifiedDeviceAllocatorCpu() const {
-    TORCH_CHECK(false, "Unified Device Allocator requires CUDA. ", CUDA_HELP);
-  }
-
   virtual bool compiledWithCuDNN() const {
     return false;
   }
