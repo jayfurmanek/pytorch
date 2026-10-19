@@ -148,7 +148,9 @@ __all__ = [
 
 _score_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
 _mask_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
-_Backend: TypeAlias = Literal["AUTO", "TRITON", "FLASH", "FLYDSL", "TRITON_DECODE"]
+_Backend: TypeAlias = Literal[
+    "AUTO", "TRITON", "FLASH", "FLYDSL", "TRITON_DECODE", "GLUON"
+]
 _R = TypeVar("_R")
 
 
@@ -317,9 +319,12 @@ class FlexKernelOptions(TypedDict, total=False):
           for BF16 on ROCm gfx950, requiring the optional FlyDSL dependency.
           Unsupported backward configurations fall back to Triton, including GQA,
           decode, gradients through LSE, and shapes exceeding the dQ workspace limit.
+        - "GLUON": Experimental: architecture-specific Gluon forward kernel (ROCm gfx950).
+          Falls back to the Triton kernel, with a warning, on other devices or
+          unsupported inputs. The backward pass uses the Triton kernel.
 
     This option cannot be combined with legacy knobs such as ``FORCE_USE_FLEX_ATTENTION``.
-    Raises an error if the requested forward backend cannot be used. Default: "AUTO"
+    Except for "GLUON", raises an error if the requested forward backend cannot be used. Default: "AUTO"
     """
 
 
