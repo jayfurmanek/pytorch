@@ -456,6 +456,37 @@ def flex_attention(
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
 
+    if backend == "GLUON":
+        from .flex_gluon import append_gluon_flex_choices
+
+        # Leaves choices empty when Gluon is unusable, falling back to Triton below.
+        append_gluon_flex_choices(
+            choices,
+            query,
+            key,
+            value,
+            original_kernel_options,
+            SPARSE_Q_BLOCK_SIZE,
+            SPARSE_KV_BLOCK_SIZE,
+            input_nodes=[
+                query,
+                key,
+                value,
+                logsumexp,
+                max_scores,
+                kv_num_blocks,
+                kv_indices,
+                full_kv_num_blocks,
+                full_kv_indices,
+            ],
+            layout=layout,
+            subgraphs=[subgraph_buffer, mask_graph_buffer],
+            mutated_inputs=[logsumexp, max_scores],
+            call_sizes=query.get_size(),
+        )
+        if choices:
+            configs = []
+
     for conf in configs:
         cur_kernel_options = original_kernel_options.copy()
         # Performance tuning

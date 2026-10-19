@@ -137,7 +137,7 @@ __all__ = [
 
 _score_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
 _mask_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
-_Backend: TypeAlias = Literal["AUTO", "TRITON", "FLASH", "TRITON_DECODE"]
+_Backend: TypeAlias = Literal["AUTO", "TRITON", "FLASH", "TRITON_DECODE", "GLUON"]
 _R = TypeVar("_R")
 
 
@@ -294,9 +294,12 @@ class FlexKernelOptions(TypedDict, total=False):
         - "TRITON": Standard Triton flex_attention kernel
         - "TRITON_DECODE": Triton flex_decoding kernel, only available for short sequence lengths with specific configurations
         - "FLASH": Experimental: Flash Attention kernel (cute-dsl), user needs to have flash installed
+        - "GLUON": Experimental: architecture-specific Gluon forward kernel (ROCm gfx950).
+          Falls back to the Triton kernel, with a warning, on other devices or
+          unsupported inputs. The backward pass uses the Triton kernel.
 
     This option cannot be combined with legacy knobs such as ``FORCE_USE_FLEX_ATTENTION``.
-    Raises an error if the requested backend cannot be used. Default: "AUTO"
+    Except for "GLUON", raises an error if the requested backend cannot be used. Default: "AUTO"
     """
 
 
