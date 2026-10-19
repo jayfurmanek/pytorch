@@ -545,6 +545,8 @@ class TritonTemplateKernel(TritonKernel):
     arguments, and prologue/epilogue fusion.
     """
 
+    jit_decorator = "@triton.jit"
+
     def __init__(
         self,
         kernel_name,
@@ -922,7 +924,7 @@ class TritonTemplateKernel(TritonKernel):
     def jit_lines(self):
         """Render decorators and metadata for the generated Triton template."""
         if self.use_jit:
-            return "@triton.jit"
+            return self.jit_decorator
 
         argdefs, _, signature, _ = self.args.python_argdefs()
         triton_meta: TritonMeta = {
@@ -1011,7 +1013,7 @@ class TritonTemplateKernel(TritonKernel):
             @triton_heuristics.template(
                 {template_args}
             )
-            @triton.jit
+            {self.jit_decorator}
         """
 
     def gen_argdefs(self):
@@ -2813,6 +2815,8 @@ class TritonTemplate(KernelTemplate):
 
     # Allow subclasses to override the kernel type
     kernel_type: type[Any] = TritonTemplateKernel
+    # None defers to config.epilogue_fusion.
+    allow_epilogue_fusion: bool | None = None
     index_counter = itertools.count()
     all_templates: dict[str, "TritonTemplate"] = {}
 
@@ -3349,6 +3353,7 @@ class TritonTemplate(KernelTemplate):
             workspace_arg=workspace_arg,
             allowed_prologue_inps=result.prologue_supported_inputs,
             hint_override=hint_override,
+            allow_epilogue_fusion=self.allow_epilogue_fusion,
         )
 
 
@@ -3493,6 +3498,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         workspace_arg: WorkspaceArg | None = None,
         allowed_prologue_inps: OrderedSet[str] | None = None,
         hint_override: int | None = None,
+        allow_epilogue_fusion: bool | None = None,
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
         self.make_kernel_render = make_kernel_render
@@ -3513,6 +3519,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
             allowed_prologue_inps if allowed_prologue_inps is not None else OrderedSet()
         )
         self.hint_override = hint_override
+        self.allow_epilogue_fusion = allow_epilogue_fusion
 
         self.n_regs = None
 
@@ -3558,6 +3565,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
             mutated_inputs=self.mutated_inputs,
             allowed_prologue_inps=self.allowed_prologue_inps,
         )
+        buffer.allow_epilogue_fusion = self.allow_epilogue_fusion
         # Pass KTC annotation to the buffer for encoding
         if "ktc" in self.annotations:
             buffer.annotations["ktc"] = self.annotations["ktc"]
@@ -4229,8 +4237,15 @@ class AlgorithmSelectorCache(PersistentCache):
         # Templates selected with input_gen_fns require specific input data to avoid IMA
         # Passing custom input gen fns to benchmark_fusion NYI, so skip deferred template selection
         # TODO(jgong5): support multi-template on CPU C++ backend
-        if input_gen_fns is not None or (
-            layout.device.type == "cpu" and config.cpu_backend != "triton"
+        # Deferred selection benchmarks choices with fused epilogues, which a
+        # template that disallows epilogue fusion cannot render.
+        if (
+            input_gen_fns is not None
+            or (layout.device.type == "cpu" and config.cpu_backend != "triton")
+            or any(
+                isinstance(c, TritonTemplateCaller) and c.allow_epilogue_fusion is False
+                for c in choices
+            )
         ):
             return_multi_template = False
 
