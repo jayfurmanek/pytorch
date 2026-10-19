@@ -32,6 +32,11 @@ if triton is not None:
         ASTSource = None
 
     try:
+        from triton.experimental.gluon._runtime import GluonASTSource
+    except ImportError:
+        GluonASTSource = None
+
+    try:
         from triton.backends.compiler import GPUTarget
     except ImportError:
 
@@ -120,6 +125,7 @@ else:
     CompiledKernel = object
     KernelInterface = object
     ASTSource = None
+    GluonASTSource = None
     GPUTarget = None
     _log2 = _raise_error
     libdevice = None
@@ -164,6 +170,7 @@ __all__ = [
     "PTXASError",
     "IntelGPUError",
     "ASTSource",
+    "GluonASTSource",
     "GPUTarget",
     "tl",
     "_log2",

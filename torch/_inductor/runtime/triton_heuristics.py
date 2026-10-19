@@ -102,6 +102,7 @@ from .triton_compat import (
     autograd_profiler,
     CompiledKernel,
     Config,
+    GluonASTSource,
     GPUTarget,
     HAS_WARP_SPEC,
     IntelGPUError,
@@ -1547,8 +1548,13 @@ class CachingAutotuner(KernelInterface):
         if not ASTSource:
             raise RuntimeError("Installed triton version too old, please upgrade")
 
+        source_cls = (
+            GluonASTSource
+            if GluonASTSource is not None and self.fn.is_gluon()
+            else ASTSource
+        )
         compile_args = (
-            ASTSource(
+            source_cls(
                 self.fn,
                 compile_meta["signature"],
                 compile_meta["constants"],
