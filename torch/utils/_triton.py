@@ -48,6 +48,23 @@ def has_triton_package() -> bool:
 
 
 @functools.cache
+def has_gluon() -> bool:
+    """Whether the installed Triton provides the Gluon frontend.
+
+    Gluon kernels are architecture-specific; callers must check the device too.
+    """
+    if not has_triton_package():
+        return False
+    try:
+        from triton.experimental import gluon  # noqa: F401
+        from triton.experimental.gluon._runtime import GluonASTSource  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@functools.cache
 def has_triton_block_ptr() -> bool:
     """Whether the installed Triton still provides the block-pointer frontend API.
 

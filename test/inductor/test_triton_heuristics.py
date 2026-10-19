@@ -70,6 +70,12 @@ from torch._inductor.runtime.triton_heuristics import (
 )
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import fresh_cache
+from torch.utils._triton import has_gluon
+
+
+if has_gluon():
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
 
 
 class _FindNamesProbe:
@@ -943,6 +949,57 @@ class TestCachingAutotunerPrecompileDriverSetup(TestCase):
         # Covers every synchronous _precompile_config() iteration.
         mock_driver_active.assert_not_called()
         self.assertEqual(len(autotuner.compile_results), num_configs)
+
+
+if has_gluon():
+
+    @gluon.jit
+    def gluon_cos_kernel(
+        in_ptr0, out_ptr0, xnumel, XBLOCK: gl.constexpr, WARP_SIZE: gl.constexpr
+    ):
+        layout: gl.constexpr = gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0])
+        xindex = gl.program_id(0) * XBLOCK + gl.arange(0, XBLOCK, layout=layout)
+        xmask = xindex < xnumel
+        tmp0 = gl.load(in_ptr0 + xindex, xmask)
+        gl.store(out_ptr0 + xindex, gl.cos(tmp0), xmask)
+
+
+@skipUnless(HAS_GPU_AND_TRITON and has_gluon(), "requires gpu and gluon")
+@instantiate_parametrized_tests
+class TestGluonPrecompile(TestCase):
+    @parametrize("static_launcher", [True, False])
+    def test_gluon_kernel(self, static_launcher):
+        device = DeviceProperties.create(torch.device(GPU_TYPE))
+        triton_meta = {
+            "signature": {
+                "in_ptr0": "*fp32",
+                "out_ptr0": "*fp32",
+                "xnumel": "i32",
+                "XBLOCK": "constexpr",
+                "WARP_SIZE": "constexpr",
+            },
+            "device": device,
+            "constants": {"WARP_SIZE": device.warp_size_or_default},
+            "configs": [AttrsDescriptorWrapper(divisible_by_16=(0, 1), equal_to_1=())],
+        }
+        autotuner = CachingAutotuner(
+            fn=gluon_cos_kernel,
+            triton_meta=triton_meta,
+            configs=[triton_config({"x": 256}, 256), triton_config({"x": 1024}, 1024)],
+            save_cache_hook=False,
+            mutated_arg_names=[],
+            reset_to_zero_arg_names=[],
+            optimize_mem=True,
+            heuristic_type=HeuristicType.POINTWISE,
+            inductor_meta={"grid_type": "Grid1D"},
+        )
+        x = torch.randn(3000, device=GPU_TYPE)
+        out = torch.empty_like(x)
+        stream = TestCachingAutotunerPlugin._get_stream()
+        with config.patch(use_static_triton_launcher=static_launcher):
+            autotuner.precompile()
+            autotuner.run(x, out, x.numel(), stream=stream)
+        self.assertEqual(out, x.cos())
 
 
 @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
