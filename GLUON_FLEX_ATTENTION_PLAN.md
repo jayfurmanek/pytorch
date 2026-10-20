@@ -2,8 +2,8 @@
 
 Status: draft. Based on `main` at `79f81f9e6d3`, Triton 3.8.0, and an MI350X (gfx950).
 This plan applies Phase 3 of `GLUON_INDUCTOR_PLAN.md` (Inductor-generated Gluon
-templates) to FlexAttention. Phase 1 of that plan (kernel-language imports) is a
-prerequisite.
+templates) to FlexAttention. It needs only a small subset of that plan's Phases 1
+and 2 (milestone 1 below); the full import-table refactor is not a prerequisite.
 
 ## Goal
 
@@ -97,36 +97,41 @@ Range-tree `tl.arange` only matters for epilogue fusion and the TMA
 ### New pieces
 
 1. **`GluonTemplate(TritonTemplate)` / `GluonTemplateKernel(TritonTemplateKernel)`**
-   in `torch/_inductor/codegen/gluon_template.py` (or alongside `select_algorithm.py`):
-   - `jit_lines`: `@gluon.jit` instead of `@triton.jit` under
-     `@triton_heuristics.template(...)`.
-   - Imports: the Gluon extension entry from Phase 1 of the general plan
-     (`from triton.experimental import gluon`,
-     `from triton.experimental.gluon import language as gl`).
-   - `generate_and_load` constexpr defines: `NAME : gl.constexpr = ...` (Gluon
-     accepts `tl.constexpr` too, but use `gl` for clarity). Verify this before
-     changing it.
-   - `size()` int64 path: `gl.full([], ...)`.
-   - `overrides = GluonKernelOverrides`.
-   - `modification()`: reuse the Triton implementation. Swap
-     `ModificationWrapper` for a subclass whose `_broadcast_index` emits `gl.full`.
-   - `store_output`: allow only the non-TMA pointer path, and reject epilogue
-     nodes (see "Fusion" below).
-   - Mark choices from this template as not fusible, for both prologue and
-     epilogue. Find the existing knob on `TritonTemplateCaller` /
-     `TritonTemplateBuffer` rather than adding a new one.
+   in `torch/_inductor/codegen/gluon_template.py` (done, milestone 2):
+   - `jit_decorator = "@gluon.jit"`, a new class attribute on
+     `TritonTemplateKernel` that `jit_lines` uses.
+   - Imports: `gen_common_triton_imports` override adds
+     `from triton.experimental import gluon` and
+     `from triton.experimental.gluon import language as gl`.
+   - `generate_and_load` constexpr defines stay `NAME : tl.constexpr = ...`;
+     Gluon accepts them as-is.
+   - Everything Inductor generates into the template (`modification()`,
+     `store_output` / epilogue hooks via `_make_codegen_hook`, `size()`) passes
+     through `triton_to_gluon`, which rewrites `tl.full` / `tl.zeros_like` /
+     `tl.zeros` / `tl.arange` to their `gl.*` counterparts. With no `layout`
+     argument these default to AutoLayout, which Gluon resolves against the
+     template's concrete layouts (verified on gfx950 for all four).
+   - Epilogue fusion is off via a new `TritonTemplate.allow_epilogue_fusion`
+     class attribute, threaded through `TritonTemplateCaller` to the existing
+     `TritonTemplateBuffer.allow_epilogue_fusion` flag. Templates that disallow
+     it also skip deferred (multi-template) selection, which benchmarks fused
+     epilogues. Prologue fusion is already off because the template never calls
+     `load_input`.
 
-2. **`GluonKernelOverrides(TritonKernelOverrides)`**: override only `constant`,
-   `_shaped_constant`, `masked`, and any op whose Triton text uses
-   `tl.full`/`tl.zeros*`/`tl.arange`. Everything else inherits. A
-   `GluonPrinter(TritonPrinter)` handles the `tl.full([], …)` / `tl.zeros_like`
-   cases in the same way.
-   - Add a guard: after `modification()` renders, assert that no `tl.full(` /
-     `tl.arange(` / `tl.zeros(` substrings remain, and raise
-     `NotImplementedError("unsupported op in score_mod for GLUON backend: ...")`
-     otherwise. This keeps new emitters from silently breaking Gluon, and the
-     lowering turns that error into a Triton fallback (see "Arch dispatch and
-     fallback").
+2. **`GluonKernelOverrides(TritonKernelOverrides)`** overrides only `constant`,
+   to emit rank-0 constants (`TritonOverrides.constant`).
+   `TritonKernelOverrides.constant` pads constants to the kernel's range-tree
+   rank, which is 1 for templates; Triton broadcasts `[1]` against 2D tiles but
+   Gluon requires equal ranks.
+
+   Why a text rewrite instead of per-op overrides plus a `GluonPrinter`: the
+   tensor-creating ops are emitted from at least six places (printer,
+   `_shaped_constant`, `masked`, `TritonKernel.indexing`,
+   `ModificationWrapper._broadcast_index`, `size()`), several inside large
+   methods that would have to be copied. Each `tl.<op>(` maps one-to-one to
+   `gl.<op>(`, so one rewrite covers all of them, including emitters added later.
+   A render-time guard is unnecessary because no `tl.<op>(` survives the
+   rewrite. An op Gluon can't compile surfaces as a compile error of that choice.
 
 3. **Runtime**: `_precompile_config` picks `GluonASTSource` (exposed via
    `runtime/triton_compat.py`, `None` when unavailable) for Gluon functions.
@@ -234,12 +239,14 @@ arch needs a fallback.
      ratio or a minimum block size). If the user forces `BLOCK_M`/`BLOCK_N`
      in `kernel_options`, they must match one of `get_configs`'s block shapes;
      otherwise it's a fallback reason too.
-  3. *At render time.* Some `score_mod`/`mask_mod` ops can't be expressed in
-     Gluon, and this only shows up when `modification()` renders (see the
-     guard in "New pieces"). The guard raises `NotImplementedError`, which
-     `maybe_append_choice` (`codegen/common.py:2879`) already catches and
-     returns. If every Gluon config fails to append, the lowering falls back
-     using the returned error as the reason.
+  3. *At compile time.* A `score_mod`/`mask_mod` op that Gluon can't compile
+     only shows up when the rendered kernel is compiled; `triton_to_gluon`
+     leaves no layout-less `tl.*` op behind, so there is nothing to catch at
+     render time. Render errors (`NotImplementedError`) are still caught by
+     `maybe_append_choice` (`select_algorithm.py:2861`). For compile errors,
+     the lowering runs `autotune_select_algorithm` on the Gluon choices and,
+     if it raises `NoValidChoicesError` because every choice failed to
+     compile, falls back to the Triton choices with that error as the reason.
 - **Fallback.** On `None`, the lowering continues down the existing Triton
   forward path with the same `kernel_options` and warns once per reason, e.g.
   `BACKEND="GLUON" has no template for gfx942; using the Triton template`. A
@@ -259,19 +266,25 @@ arch needs a fallback.
 
 The flex output feeds user code, so Inductor will try to fuse epilogues into
 `store_output`. Epilogue codegen uses `TritonKernel` range trees (`tl.arange`)
-and pointwise overrides, so Gluon choices must be marked non-fusible for v1.
-v2 can route epilogue nodes through `GluonKernelOverrides` and emit index
-tensors in the store layout.
+and pointwise overrides, so Gluon choices are marked non-fusible for v1.
+Observed in milestone 2: with the flag lifted, a pointwise `relu` epilogue
+fuses into the toy Gluon template and is numerically correct, because
+`triton_to_gluon` also covers the epilogue hook. v2 needs broader validation
+(reductions, multi-output, captured-buffer epilogues), not new machinery.
 
 ## Milestones and PRs
 
-1. **Prereqs** (general plan, Phase 1):
-   - `has_gluon()`;
-   - the Gluon import extension;
-   - `GluonASTSource` in `triton_compat`;
-   - `_precompile_config` branch.
+1. **Prereqs** (a subset of the general plan's Phases 1 and 2):
+   - `has_gluon()` (Phase 1);
+   - `GluonASTSource` in `triton_compat` (Phase 1);
+   - the `_precompile_config` branch (Phase 2's runtime bullet);
+   - no static-launcher change: verified on gfx950 that a Gluon kernel compiles
+     in async compile workers and runs correctly with the static launcher both
+     on and off.
 
-   No output change.
+   No output change. The Phase 1 import-extension table is not needed:
+   `GluonTemplateKernel` overrides the `gen_common_triton_imports` classmethod
+   to add the Gluon imports, so they appear only in Gluon template kernels.
 2. **`GluonTemplate` infrastructure + `GluonKernelOverrides`**. Test with a toy
    Gluon template (e.g. elementwise add with a `{{modification}}` hook) in
    `test/inductor/test_gluon_template.py`. Cover a set of score_mods: constants,
@@ -280,10 +293,73 @@ tensors in the store layout.
 3. **Gluon flex forward template + lowering branch** for gfx950, behind
    `BACKEND="GLUON"`, including the arch registry and the Triton fallback for
    every other arch.
+
+   Done: `kernel/flex/templates/gluon_flex_attention_gfx950.py.jinja` and
+   `kernel/flex/flex_gluon.py`. The template takes tokenspeed's MFMA v4
+   `[32, 32, 16]` and dot-operand layouts, padded shared layouts and async
+   K/V staging, and keeps flex's semantics and two-pass block-sparse loop. It
+   is non-persistent, with flex's grid. The Gluon branch sits just before the
+   Triton config loop, so it reuses all of the lowering's setup. Fallback
+   layers 1 and 2 are implemented. Layer 3 (compile failure, via
+   `NoValidChoicesError`) is not yet: it needs the Triton choice loop
+   factored into a function.
+
+   Measured on MI350X, bf16 forward, both max-autotune, B*S = 16k, H = 16:
+   Gluon is 1.04-1.13x the Triton template on causal and sliding-window
+   (1024) masks for D = 64 and 128, and 0.95-0.98x on causal at 16k.
+   tokenspeed's 1.6-2.1x at D = 64 comes from what v1 leaves out: the
+   persistent, swizzled scheduler and the `main_end` split that skips
+   masking on non-diagonal tiles.
 4. **Performance**: pipelining/ping-pong and config tuning; benchmark against
    the Triton template with
    `benchmarks/transformer/score_mod.py` (or the attention-gym
    variants: causal, sliding window, document mask, ALiBi, soft-cap).
+
+   Target: at least 1.4x the Triton template on causal D = 64 (tokenspeed's
+   lead was 1.3-2.0x). Met. MI350X, bf16 forward, both max-autotune, static
+   shapes, H = 32 / Hkv = 8 on tokenspeed's layout, causal:
+
+   | D | S | tokenspeed | Triton | Gluon | Gluon / Triton |
+   |---|---|---|---|---|---|
+   | 64 | 1k-16k | 376-675 | 282-468 | 403-689 | 1.43-1.72 |
+   | 128 | 1k-16k | 321-514 | 365-597 | 402-680 | 1.10-1.26 |
+
+   With H = 16 (no GQA): causal D = 64 1.44-1.74x, D = 128 1.12-1.27x;
+   sliding window (1024) D = 64 1.20-1.49x, D = 128 1.08-1.28x. Gluon now
+   matches or beats tokenspeed on causal D = 64 and beats it on D = 128.
+
+   What mattered, in order:
+   - **Persistent swizzled scheduler** (about +25-40% at D = 64): an
+     XCD-aware remap plus alternating q-slot direction across q cycles, as in
+     tokenspeed. Turning tokenspeed's own swizzle off dropped it below Gluon
+     v1, which is how this was identified. Slot counts are computed at run
+     time because flex's batch and head counts can be dynamic;
+     `NUM_PROGRAMS` (2, 3 or 4 per CU) is autotuned, and 4 per CU won
+     everywhere.
+   - **One scale multiply per score** (about +10-17% at long S): the scale is
+     folded into a single constexpr `SCORE_SCALE` applied inside the exp2
+     argument (fusing into an FMA) and to the row max rather than to every
+     score, which is exact for a positive scale. With no score_mod
+     (`SCORE_MOD_IS_IDENTITY`, from `is_trivial_score_graph`) and a positive
+     `SM_SCALE`, this also absorbs `SM_SCALE`, so it equals the cost of
+     `PRESCALE_QK` without `PRESCALE_QK`'s bf16 rounding of Q. A negative
+     scale keeps the separate `qk *= SM_SCALE`, since scaling the row max is
+     only exact for a positive factor (`test_negative_scale`).
+   - **Block-index loads** (about +5%, at long S): the index load is a
+     vector load that shares vmcnt with the async K/V copies, and LLVM had
+     turned the masked load into a branch with a wait at the end of each
+     iteration. It is now prefetched one tile ahead, unmasked with a clamped
+     index, and added to the vector offsets rather than the scalar base
+     pointer.
+
+   Not needed so far: double-buffered K/V and ping-pong. Both are still
+   options if a later target needs more.
+
+   Benchmarking pitfall: `torch_key()` (the FX graph cache key) hashes only
+   `.py` files, so after editing a `.jinja` template a dev checkout silently
+   reuses stale kernels. Always benchmark template edits with a fresh
+   `TORCHINDUCTOR_CACHE_DIR`. This is a pre-existing upstream issue that
+   affects every Inductor Jinja template.
 5. **Optional**: gfx942 (a `cdna3` template plus a registry entry); AUTO selection via the choices hook; Gluon
    backward; epilogue fusion.
 
@@ -311,8 +387,8 @@ Fallback tests run on any GPU, without the arch skip:
   generated code contains no `@gluon.jit`.
 - Each layer falls back the same way on gfx950: a dynamic head dim (layer 1),
   an unsupported head dim or a forced `BLOCK_M` outside the config space
-  (layer 2), and a `score_mod` that trips the render guard (layer 3; patch an
-  override to emit `tl.full` to force it).
+  (layer 2), and a `score_mod` whose Gluon kernel fails to compile (layer 3;
+  patch `triton_to_gluon` to the identity to force it).
 - On gfx950 with supported inputs, the generated code does contain
   `@gluon.jit`, so that a silent fallback can't pass the numerics tests.
 

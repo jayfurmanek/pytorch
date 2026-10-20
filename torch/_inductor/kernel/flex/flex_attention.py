@@ -468,6 +468,7 @@ def flex_attention(
             original_kernel_options,
             SPARSE_Q_BLOCK_SIZE,
             SPARSE_KV_BLOCK_SIZE,
+            is_trivial_score_graph(subgraph.graph_module),
             input_nodes=[
                 query,
                 key,
