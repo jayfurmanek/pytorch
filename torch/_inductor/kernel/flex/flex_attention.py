@@ -291,7 +291,9 @@ def flex_attention(
     can_use_decode = _use_flex_decoding(
         query, kv_indices, value, kernel_options, enable_gqa
     )
-    use_decode = (backend == "TRITON_DECODE") or (backend == "AUTO" and can_use_decode)
+    use_decode = backend == "TRITON_DECODE" or (
+        backend in ("AUTO", "GLUON") and can_use_decode
+    )
 
     if backend == "TRITON_DECODE" and not can_use_decode:
         raise RuntimeError(
@@ -300,6 +302,11 @@ def flex_attention(
         )
 
     if use_decode:
+        if backend == "GLUON":
+            warning_once(
+                log,
+                "BACKEND='GLUON' has no decode template; using the Triton decode kernel.",
+            )
         return create_flex_decoding_kernel(
             query,
             key,

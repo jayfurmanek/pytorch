@@ -20,7 +20,8 @@ a one-time warning. See "Arch dispatch and fallback" below.
 
 Non-goals for the first iteration:
 - Gluon backward.
-- Gluon decode.
+- Gluon decode. Short queries take the Triton decode kernel (see "Arch dispatch
+  and fallback").
 - Epilogue or prologue fusion into the Gluon template.
 - Auto-selection under `BACKEND="AUTO"`.
 
@@ -252,7 +253,12 @@ arch needs a fallback.
   `BACKEND="GLUON" has no template for gfx942; using the Triton template`. A
   Gluon-only option that Triton doesn't understand is dropped before
   fallback, so that it can't reach the Triton template.
-- **Backward and decode** are unaffected; they already use Triton.
+- **Backward** is unaffected; it already uses Triton.
+- **Decode.** Decode routing runs before the Gluon branch. Queries that
+  `_use_flex_decoding` accepts (query length < 128, static batch and heads)
+  take the Triton decode kernel under `BACKEND="GLUON"` as under `AUTO`, with a
+  one-time warning. Otherwise a 1-row query would pad to a 128-row Gluon tile
+  with no split over KV.
 - **AUTO, later.** `append_flex_attention_choices` simply adds no Gluon choices
   when the lookup returns `None`. No warning in that case, since the user didn't
   ask for Gluon.
@@ -359,13 +365,26 @@ fuses into the toy Gluon template and is numerically correct, because
    Not needed so far: double-buffered K/V and ping-pong. Both are still
    options if a later target needs more.
 
+   Small problems. Launching all `NUM_PROGRAMS` programs costs nothing
+   measurable: trimming the launch to the work-item count changed nothing
+   (within 0.2 us) even with 1023 of 1024 programs idle. Gluon is, however,
+   5-55% slower than the Triton template below about 4 work items per CU
+   (batch x heads x 128-row query blocks < ~1024 on MI350X), e.g. 60 vs 39 us
+   for B = 2, H = 16, S = 1k, D = 128, causal. The likely cause (unverified) is
+   the fixed `BLOCK_M = 128`: each work item is one 4-warp workgroup walking
+   its whole KV row, while Triton can pick smaller blocks. See the split-KV
+   item in milestone 5.
+
    Benchmarking pitfall: `torch_key()` (the FX graph cache key) hashes only
    `.py` files, so after editing a `.jinja` template a dev checkout silently
    reuses stale kernels. Always benchmark template edits with a fresh
    `TORCHINDUCTOR_CACHE_DIR`. This is a pre-existing upstream issue that
    affects every Inductor Jinja template.
 5. **Optional**: gfx942 (a `cdna3` template plus a registry entry); AUTO selection via the choices hook; Gluon
-   backward; epilogue fusion.
+   backward; epilogue fusion; a Gluon split-KV template. Splitting KV across
+   programs when (batch, head, query block) work is scarce would serve both
+   decode (now routed to the Triton decode kernel) and small prefills, where
+   the persistent template trails Triton (see milestone 4).
 
 ## Testing
 
@@ -393,6 +412,8 @@ Fallback tests run on any GPU, without the arch skip:
   an unsupported head dim or a forced `BLOCK_M` outside the config space
   (layer 2), and a `score_mod` whose Gluon kernel fails to compile (layer 3;
   patch `triton_to_gluon` to the identity to force it).
+- A query shorter than 128 takes the Triton decode kernel (`SPLIT_KV` in the
+  generated code, no `@gluon.jit`) and warns.
 - On gfx950 with supported inputs, the generated code does contain
   `@gluon.jit`, so that a silent fallback can't pass the numerics tests.
 
