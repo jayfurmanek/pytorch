@@ -302,6 +302,17 @@ class TestFlexGluon(InductorTestCase):
             )
             self._assert_falls_back(q, k, v, reason)
 
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    @dtypes(torch.bfloat16)
+    def test_short_query_uses_triton_decode(self, device, dtype):
+        q, k, v = self._make_qkv(device, dtype, S_q=16, S_kv=1024)
+        with self.assertLogs(FLEX_LOGGER, level="WARNING") as logs:
+            out, (code, *_) = run_and_get_code(_compile_flex("GLUON"), q, k, v)
+        self.assertNotIn("@gluon.jit", code)
+        self.assertIn("SPLIT_KV", code)
+        self.assertIn("no decode template", "\n".join(logs.output))
+        self.assertEqual(out, _compile_flex("AUTO")(q, k, v))
+
     @requires_gluon_template
     @dtypes(torch.bfloat16)
     def test_fallback_head_dim(self, device, dtype):
