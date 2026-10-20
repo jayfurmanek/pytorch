@@ -462,13 +462,20 @@ def flex_attention(
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
+    input_gen_fns = {
+        5: create_num_blocks_fake_generator(kv_indices),
+        6: create_indices_fake,
+        7: create_num_blocks_fake_generator(full_kv_indices),
+        8: create_indices_fake,
+    }
 
     if backend == "GLUON":
-        from .flex_gluon import append_gluon_flex_choices
+        from .flex_gluon import append_gluon_flex_choices, select_gluon_flex_choice
 
-        # Leaves choices empty when Gluon is unusable, falling back to Triton below.
+        # Empty when Gluon is unusable; Triton choices are then built below.
+        gluon_choices: list[Any] = []
         append_gluon_flex_choices(
-            choices,
+            gluon_choices,
             query,
             key,
             value,
@@ -492,8 +499,19 @@ def flex_attention(
             mutated_inputs=[logsumexp, max_scores],
             call_sizes=query.get_size(),
         )
-        if choices:
-            configs = []
+        gluon_out = None
+        if gluon_choices:
+            gluon_out = select_gluon_flex_choice(gluon_choices, layout, input_gen_fns)
+        if gluon_out is not None:
+            return _finalize_flex_forward(
+                gluon_out,
+                logsumexp,
+                max_scores,
+                subgraph_buffer,
+                mask_graph_buffer,
+                score_mod_other_buffers,
+                mask_mod_other_buffers,
+            )
 
     for conf in configs:
         cur_kernel_options = original_kernel_options.copy()
@@ -650,13 +668,6 @@ def flex_attention(
             SPARSE_KV_BLOCK_SIZE,
         )
 
-    input_gen_fns = {
-        5: create_num_blocks_fake_generator(kv_indices),
-        6: create_indices_fake,
-        7: create_num_blocks_fake_generator(full_kv_indices),
-        8: create_indices_fake,
-    }
-
     out, _ = autotune_select_algorithm(
         "flex_attention",
         choices,
@@ -666,6 +677,26 @@ def flex_attention(
         input_gen_fns=input_gen_fns,
     )
 
+    return _finalize_flex_forward(
+        out,
+        logsumexp,
+        max_scores,
+        subgraph_buffer,
+        mask_graph_buffer,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    )
+
+
+def _finalize_flex_forward(
+    out,
+    logsumexp,
+    max_scores,
+    subgraph_buffer,
+    mask_graph_buffer,
+    score_mod_other_buffers,
+    mask_mod_other_buffers,
+):
     # need subgraph inputs and outputs to analyze all symints used in flex attention
     out.data.data.subgraph_inps = list(score_mod_other_buffers) + list(
         mask_mod_other_buffers
@@ -673,7 +704,6 @@ def flex_attention(
     out.data.data.subgraph_outs = get_fwd_subgraph_outputs(
         subgraph_buffer, mask_graph_buffer
     )
-
     return (out, logsumexp, max_scores)
 
 
