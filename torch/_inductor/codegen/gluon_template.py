@@ -1,11 +1,23 @@
+from __future__ import annotations
+
 import re
-from collections.abc import Callable
 from functools import lru_cache
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+import torch
 
 from ..select_algorithm import TritonTemplate, TritonTemplateKernel
 from ..utils import IndentedBuffer
 from .triton import TritonKernelOverrides, TritonOverrides
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ..scheduler import BaseSchedulerNode, Scheduler
+
+
+fusion_log = torch._logging.getArtifactLogger(__name__, "fusion")
 
 
 # Gluon rejects these tl ops because they take no layout. Their gl
@@ -63,12 +75,53 @@ class GluonTemplateKernel(TritonTemplateKernel):
         return lambda: triton_to_gluon(hook())
 
 
+# Fusing these into the Gluon flex attention template measured 25-30% slower
+# than running them as a separate kernel (cos/sin on MI350X), while cheap
+# epilogues (relu, casts, affine, residual add) were 5-9% faster.
+_COSTLY_EPILOGUE_OPS = (
+    "cos", "sin", "tan", "acos", "asin", "atan", "atan2",
+    "cosh", "sinh", "tanh", "acosh", "asinh", "atanh",
+    "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+    "erf", "erfc", "erfinv", "pow", "lgamma", "digamma",
+)  # fmt: skip
+
+
+def check_gluon_epilogue_fusion(
+    scheduler: Scheduler, template: BaseSchedulerNode, epilogue: BaseSchedulerNode
+) -> bool:
+    """Fuse an epilogue only if it has no costly ops and the fused kernel
+    compiles. Template selection's compile fallback only covers the unfused
+    kernel, so a fused kernel that fails to compile must be caught here.
+    Timing the fusion instead (benchmark_fusion) is not representative for
+    flex: its benchmark inputs zero the block mask."""
+    from ..scheduler import SchedulerNode
+
+    for node in epilogue.get_nodes():
+        if isinstance(node, SchedulerNode) and any(
+            node._body.has_op(op) for op in _COSTLY_EPILOGUE_OPS
+        ):
+            fusion_log.debug("not fusing costly epilogue %s", node.get_name())
+            return False
+    try:
+        future, mod = scheduler.compile_kernel(
+            [*template.get_nodes(), *epilogue.get_nodes()]
+        )
+        if future is not None:
+            future.result()
+        else:
+            mod.triton_.precompile()
+    except Exception as e:
+        fusion_log.debug("not fusing epilogue that fails to compile: %s", e)
+        return False
+    return True
+
+
 class GluonTemplate(TritonTemplate):
     """A TritonTemplate whose source is a Gluon kernel.
 
-    Epilogue fusion is disabled until fused epilogue codegen is validated
-    under Gluon.
+    Epilogue fusion follows config.epilogue_fusion, subject to
+    check_gluon_epilogue_fusion.
     """
 
     kernel_type = GluonTemplateKernel
-    allow_epilogue_fusion = False
+    epilogue_fusion_check = staticmethod(check_gluon_epilogue_fusion)

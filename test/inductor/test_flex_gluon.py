@@ -361,6 +361,39 @@ class TestFlexGluon(InductorTestCase):
         self.assertEqual(bool(broken_kernels), case == "compile_failure")
         self.assertEqual(out, _compile_flex("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
 
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    @parametrize("case", ["relu", "cos", "compile_failure"])
+    def test_epilogue_fusion(self, device, dtype, case):
+        # Cheap epilogues fuse; costly ops, and fused kernels that fail to
+        # compile, run as a separate kernel instead.
+        q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256)
+        epilogue = torch.cos if case == "cos" else torch.relu
+        to_gluon = gluon_template.triton_to_gluon
+
+        def broken(code):
+            code = to_gluon(code)
+            return f"{code}\nundefined_name" if "maximum" in code else code
+
+        def fn(backend):
+            options = {"BACKEND": backend}
+            return torch.compile(
+                lambda q, k, v: epilogue(
+                    flex_attention(q, k, v, kernel_options=options)
+                )
+            )
+
+        with mock.patch.object(
+            gluon_template,
+            "triton_to_gluon",
+            broken if case == "compile_failure" else to_gluon,
+        ):
+            out, (code, *_) = run_and_get_code(fn("GLUON"), q, k, v)
+        self.assertIn("@gluon.jit", code)
+        separate_kernel = f"triton_poi_fused_{epilogue.__name__}"
+        self.assertEqual(separate_kernel in code, case != "relu")
+        self.assertEqual(out, fn("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
+
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     @dtypes(torch.bfloat16)
     def test_short_query_uses_triton_decode(self, device, dtype):
