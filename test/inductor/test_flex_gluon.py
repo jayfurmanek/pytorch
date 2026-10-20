@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 import torch._inductor.codegen.gluon_template as gluon_template
 import torch._inductor.kernel.flex.flex_gluon as flex_gluon
+from torch._inductor import config as inductor_config, select_algorithm
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code
 from torch._logging._internal import warning_once
@@ -302,6 +303,63 @@ class TestFlexGluon(InductorTestCase):
                 else "requires ROCm"
             )
             self._assert_falls_back(q, k, v, reason)
+
+    def _auto_choices(self, q, k, v):
+        """Compile BACKEND="AUTO" and return the output, the generated code and
+        the descriptions of the choices that were benchmarked."""
+        descriptions = []
+
+        def saver(timings, name, *args):
+            if name == "flex_attention":
+                descriptions.extend(c.description for c in timings)
+
+        select_algorithm.add_feedback_saver(saver)
+        try:
+            out, (code, *_) = run_and_get_code(_compile_flex("AUTO"), q, k, v)
+        finally:
+            select_algorithm.clear_feedback_savers()
+        return out, code, descriptions
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    @parametrize("enabled", [False, True])
+    def test_auto_autotunes_gluon(self, device, dtype, enabled):
+        q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256, D=64)
+        with inductor_config.patch(max_autotune=True, max_autotune_flex_gluon=enabled):
+            out, _, descriptions = self._auto_choices(q, k, v)
+        num_gluon = sum("NUM_PROGRAMS" in d for d in descriptions)
+        self.assertEqual(num_gluon, 2 if enabled else 0)
+        self.assertGreater(len(descriptions), num_gluon)
+        self.assertEqual(out, _compile_flex("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    @parametrize("case", ["unsupported", "compile_failure"])
+    def test_auto_gluon_is_silent(self, device, dtype, case):
+        # Unlike BACKEND="GLUON", AUTO never warns about Gluon: it only adds
+        # choices when they are usable, and a failed compile loses autotuning.
+        D = 32 if case == "unsupported" else 64
+        q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256, D=D)
+        to_gluon = gluon_template.triton_to_gluon
+        broken_kernels = []
+
+        def broken(code):
+            code = to_gluon(code)
+            if "post_mod_scores" not in code:
+                return code
+            broken_kernels.append(code)
+            return f"{code}\nundefined_name"
+
+        with (
+            inductor_config.patch(max_autotune=True, max_autotune_flex_gluon=True),
+            mock.patch.object(gluon_template, "triton_to_gluon", broken),
+            self.assertNoLogs(FLEX_LOGGER, level="WARNING"),
+        ):
+            out, code, descriptions = self._auto_choices(q, k, v)
+        self.assertNotIn("@gluon.jit", code)
+        self.assertFalse(any("NUM_PROGRAMS" in d for d in descriptions))
+        self.assertEqual(bool(broken_kernels), case == "compile_failure")
+        self.assertEqual(out, _compile_flex("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
 
     @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
     @dtypes(torch.bfloat16)

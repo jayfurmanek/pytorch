@@ -781,6 +781,12 @@ max_autotune_flex_search_space: Literal["DEFAULT", "EXHAUSTIVE"] = os.environ.ge
     "TORCHINDUCTOR_MAX_AUTOTUNE_FLEX_SEARCH_SPACE", "DEFAULT"
 ).upper()  # type: ignore[assignment]
 
+# (Experimental) Under flex_attention BACKEND="AUTO" with max-autotune, also
+# autotune the Gluon forward template on GPUs that have one (currently gfx950).
+max_autotune_flex_gluon: bool = (
+    os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_FLEX_GLUON", "0") == "1"
+)
+
 
 # Fall back to ATen for all ops by default, except those nodes that users explicitly
 # annotated with regional inductor compile. Please read torch.fx.passes.regional_inductor

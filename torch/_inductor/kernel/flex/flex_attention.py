@@ -18,6 +18,7 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.nn.attention.flex_attention import _Backend
 from torch.utils._sympy.functions import FloorDiv
 
+from ... import config
 from ...ir import ComputedBuffer, ExternKernel, FixedLayout, TensorBox
 from ...lowering import empty, empty_strided, lowerings, register_lowering, to_dtype
 from ...runtime.runtime_utils import is_power_of_2
@@ -469,12 +470,18 @@ def flex_attention(
         8: create_indices_fake,
     }
 
-    if backend == "GLUON":
-        from .flex_gluon import append_gluon_flex_choices, select_gluon_flex_choice
+    use_gluon = backend == "GLUON" or (
+        backend == "AUTO" and config.max_autotune and config.max_autotune_flex_gluon
+    )
+    if use_gluon:
+        from .flex_gluon import (
+            append_gluon_flex_choices,
+            select_gluon_flex_choice,
+            warn_gluon_fallback,
+        )
 
-        # Empty when Gluon is unusable; Triton choices are then built below.
         gluon_choices: list[Any] = []
-        append_gluon_flex_choices(
+        reason = append_gluon_flex_choices(
             gluon_choices,
             query,
             key,
@@ -499,19 +506,24 @@ def flex_attention(
             mutated_inputs=[logsumexp, max_scores],
             call_sizes=query.get_size(),
         )
-        gluon_out = None
-        if gluon_choices:
+        if backend == "AUTO":
+            # Gluon competes with the Triton choices built below; a Gluon choice
+            # that fails to compile simply loses autotuning.
+            choices.extend(gluon_choices)
+        elif reason is not None:
+            warn_gluon_fallback(reason)
+        else:
             gluon_out = select_gluon_flex_choice(gluon_choices, layout, input_gen_fns)
-        if gluon_out is not None:
-            return _finalize_flex_forward(
-                gluon_out,
-                logsumexp,
-                max_scores,
-                subgraph_buffer,
-                mask_graph_buffer,
-                score_mod_other_buffers,
-                mask_mod_other_buffers,
-            )
+            if gluon_out is not None:
+                return _finalize_flex_forward(
+                    gluon_out,
+                    logsumexp,
+                    max_scores,
+                    subgraph_buffer,
+                    mask_graph_buffer,
+                    score_mod_other_buffers,
+                    mask_mod_other_buffers,
+                )
 
     for conf in configs:
         cur_kernel_options = original_kernel_options.copy()
