@@ -7336,6 +7336,13 @@ class Scheduler:
         Otherwise, return True if fusion can brings speedup.
         """
 
+        template = node1.get_template_node()
+        if (
+            isinstance(template, ir.TritonTemplateBuffer)
+            and template.epilogue_fusion_check is not None
+        ):
+            return FusionResult.fuse(template.epilogue_fusion_check(self, node1, node2))
+
         is_multi_template = any(
             n.is_template()
             and isinstance(n.get_template_node(), ir.MultiTemplateBuffer)

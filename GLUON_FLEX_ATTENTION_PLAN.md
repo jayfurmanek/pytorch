@@ -22,7 +22,8 @@ Non-goals for the first iteration:
 - Gluon backward.
 - Gluon decode. Short queries take the Triton decode kernel (see "Arch dispatch
   and fallback").
-- Epilogue or prologue fusion into the Gluon template.
+- Prologue fusion into the Gluon template (epilogue fusion followed in
+  milestone 5).
 - Auto-selection under `BACKEND="AUTO"` by default (it is opt-in; see milestone 5).
 
 ## Findings that shape the design
@@ -112,12 +113,12 @@ Range-tree `tl.arange` only matters for epilogue fusion and the TMA
      `tl.zeros` / `tl.arange` to their `gl.*` counterparts. With no `layout`
      argument these default to AutoLayout, which Gluon resolves against the
      template's concrete layouts (verified on gfx950 for all four).
-   - Epilogue fusion is off via a new `TritonTemplate.allow_epilogue_fusion`
-     class attribute, threaded through `TritonTemplateCaller` to the existing
-     `TritonTemplateBuffer.allow_epilogue_fusion` flag. Templates that disallow
-     it also skip deferred (multi-template) selection, which benchmarks fused
-     epilogues. Prologue fusion is already off because the template never calls
-     `load_input`.
+   - Epilogue fusion was off in v1 via a new
+     `TritonTemplate.allow_epilogue_fusion` class attribute, threaded through
+     `TritonTemplateCaller` to the existing
+     `TritonTemplateBuffer.allow_epilogue_fusion` flag. Milestone 5 turned it
+     on behind a per-template check (see "Fusion"). Prologue fusion is off
+     because the template never calls `load_input`.
 
 2. **`GluonKernelOverrides(TritonKernelOverrides)`** overrides only `constant`,
    to emit rank-0 constants (`TritonOverrides.constant`).
@@ -281,11 +282,43 @@ arch needs a fallback.
 
 The flex output feeds user code, so Inductor will try to fuse epilogues into
 `store_output`. Epilogue codegen uses `TritonKernel` range trees (`tl.arange`)
-and pointwise overrides, so Gluon choices are marked non-fusible for v1.
-Observed in milestone 2: with the flag lifted, a pointwise `relu` epilogue
-fuses into the toy Gluon template and is numerically correct, because
-`triton_to_gluon` also covers the epilogue hook. v2 needs broader validation
-(reductions, multi-output, captured-buffer epilogues), not new machinery.
+and pointwise overrides; `triton_to_gluon` also covers the epilogue hook, so
+no Gluon-specific epilogue codegen is needed.
+
+v1 disabled epilogue fusion for Gluon choices. Milestone 5 enables it
+(`allow_epilogue_fusion` follows `config.epilogue_fusion`), subject to
+`check_gluon_epilogue_fusion` in `codegen/gluon_template.py`, which the
+scheduler calls from `speedup_by_fusion` through a new
+`TritonTemplate.epilogue_fusion_check` hook (threaded to
+`TritonTemplateBuffer` like `allow_epilogue_fusion`). It fuses an epilogue only
+if:
+
+- it has no costly ops (trig, hyperbolic, exp/log, erf, pow, ...); and
+- the fused kernel compiles. Template selection's compile fallback covers only
+  the unfused kernel, and without `benchmark_fusion` the scheduler fuses
+  without compiling first, so a fused kernel that failed to compile would
+  otherwise be a hard error.
+
+Templates with a check skip deferred (multi-template) selection, which would
+fuse epilogues without it.
+
+Measured on MI350X (bf16 causal, B = 2, H = 8, S = 1k, D = 128), with fusion
+forced on for every epilogue: all compiled and fused output matched the
+unfused Gluon kernel bit for bit (pointwise, casts, residual add, broadcast
+bias, two consumers, non-divisible S, GQA, dynamic shapes, training). Cheap
+epilogues ran 5-9% faster fused (`relu` 41.1 -> 38.1 us, `+ residual`
+42.5 -> 40.5 us); `cos` ran 30% slower (42.2 -> 55.1 us) at unchanged VGPR
+use, and `cos` + `sin` doubled VGPRs and dropped to occupancy 1. Triton flex
+also loses fusing `cos`, by less. `transpose(1, 2).reshape(...)` is not fused
+by either backend.
+
+Why a static op rule instead of timing: the scheduler's fusion benchmark
+(`benchmark_fusion`) builds inputs with `rand_strided`, which zero-fills
+integer tensors, so flex's `kv_num_blocks` is 0 and the attention does no
+work. It measured `cos` as a 1.04x speedup. Flex's `input_gen_fns` are not
+used there (select_algorithm notes this as not yet implemented). Giving
+template buffers representative benchmark inputs would fix this for Triton
+flex too, and is the follow-up if the op rule proves too coarse.
 
 ## Milestones and PRs
 
@@ -392,6 +425,8 @@ fuses into the toy Gluon template and is numerically correct, because
 5. **Optional**: gfx942 (a `cdna3` template plus a registry entry); AUTO
    selection; Gluon backward; epilogue fusion; a Gluon split-KV template.
 
+   Epilogue fusion is done; see "Fusion".
+
    AUTO selection is done, opt-in via `config.max_autotune_flex_gluon` (see
    "Lowering changes"). On MI350X, bf16 causal, it picks Gluon for B = 16,
    H = 32, S = 1k, D = 64 (189 vs 249 us) and B = 4, H = 32, S = 4k, D = 64
@@ -442,6 +477,8 @@ Fallback tests run on any GPU, without the arch skip:
 - `AUTO` with max-autotune benchmarks the Gluon configs alongside Triton's only
   when `max_autotune_flex_gluon` is set, and stays silent when Gluon is
   unsupported or fails to compile.
+- Epilogue fusion: `relu` fuses into the Gluon kernel; `cos`, and a `relu`
+  whose fused kernel fails to compile, run as a separate pointwise kernel.
 - On gfx950 with supported inputs, the generated code does contain
   `@gluon.jit`, so that a silent fallback can't pass the numerics tests.
 

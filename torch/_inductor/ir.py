@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     from .codegen.wrapper import PythonWrapperCodegen
     from .graph import GraphLowering
     from .kernel.gemm_epilogue import GemmEpiloguePlan, GemmReductionPlan
+    from .scheduler import BaseSchedulerNode, Scheduler
     from .utils import IndentedBuffer
 
 else:
@@ -175,6 +176,11 @@ _IntLike: TypeAlias = int | Expr
 _NumLike: TypeAlias = int | float | Expr
 
 _OpOverloads: TypeAlias = torch._ops.OpOverload | torch._ops.HigherOrderOperator
+
+# (scheduler, template node, epilogue node) -> whether to fuse the epilogue.
+EpilogueFusionCheck: TypeAlias = Callable[
+    ["Scheduler", "BaseSchedulerNode", "BaseSchedulerNode"], bool
+]
 
 
 class ArgProperty(TypedDict, total=False):
@@ -6165,6 +6171,8 @@ class TemplateBuffer(OperationBuffer):
         # config.epilogue_fusion / config.prologue_fusion.
         self.allow_epilogue_fusion: bool | None = None
         self.allow_prologue_fusion: bool | None = None
+        # Decides each epilogue fusion that config allows; None accepts all.
+        self.epilogue_fusion_check: EpilogueFusionCheck | None = None
 
     @property
     def dtype(self) -> torch.dtype:

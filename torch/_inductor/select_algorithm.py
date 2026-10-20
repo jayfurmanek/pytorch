@@ -2817,6 +2817,8 @@ class TritonTemplate(KernelTemplate):
     kernel_type: type[Any] = TritonTemplateKernel
     # None defers to config.epilogue_fusion.
     allow_epilogue_fusion: bool | None = None
+    # Decides each epilogue fusion that allow_epilogue_fusion permits.
+    epilogue_fusion_check: ir.EpilogueFusionCheck | None = None
     index_counter = itertools.count()
     all_templates: dict[str, "TritonTemplate"] = {}
 
@@ -3354,6 +3356,7 @@ class TritonTemplate(KernelTemplate):
             allowed_prologue_inps=result.prologue_supported_inputs,
             hint_override=hint_override,
             allow_epilogue_fusion=self.allow_epilogue_fusion,
+            epilogue_fusion_check=self.epilogue_fusion_check,
         )
 
 
@@ -3499,6 +3502,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         allowed_prologue_inps: OrderedSet[str] | None = None,
         hint_override: int | None = None,
         allow_epilogue_fusion: bool | None = None,
+        epilogue_fusion_check: ir.EpilogueFusionCheck | None = None,
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
         self.make_kernel_render = make_kernel_render
@@ -3520,6 +3524,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         )
         self.hint_override = hint_override
         self.allow_epilogue_fusion = allow_epilogue_fusion
+        self.epilogue_fusion_check = epilogue_fusion_check
 
         self.n_regs = None
 
@@ -3566,6 +3571,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
             allowed_prologue_inps=self.allowed_prologue_inps,
         )
         buffer.allow_epilogue_fusion = self.allow_epilogue_fusion
+        buffer.epilogue_fusion_check = self.epilogue_fusion_check
         # Pass KTC annotation to the buffer for encoding
         if "ktc" in self.annotations:
             buffer.annotations["ktc"] = self.annotations["ktc"]
@@ -4237,13 +4243,18 @@ class AlgorithmSelectorCache(PersistentCache):
         # Templates selected with input_gen_fns require specific input data to avoid IMA
         # Passing custom input gen fns to benchmark_fusion NYI, so skip deferred template selection
         # TODO(jgong5): support multi-template on CPU C++ backend
-        # Deferred selection benchmarks choices with fused epilogues, which a
-        # template that disallows epilogue fusion cannot render.
+        # Deferred selection benchmarks choices with fused epilogues, which
+        # bypasses a template's epilogue_fusion_check and cannot render for a
+        # template that disallows epilogue fusion.
         if (
             input_gen_fns is not None
             or (layout.device.type == "cpu" and config.cpu_backend != "triton")
             or any(
-                isinstance(c, TritonTemplateCaller) and c.allow_epilogue_fusion is False
+                isinstance(c, TritonTemplateCaller)
+                and (
+                    c.allow_epilogue_fusion is False
+                    or c.epilogue_fusion_check is not None
+                )
                 for c in choices
             )
         ):

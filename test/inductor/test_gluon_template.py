@@ -237,7 +237,7 @@ class TestGluonTemplate(TestCase):
         ):
             out, (code, *_) = run_and_get_code(torch.compile(fn, fullgraph=True), q)
         self.assertEqual(out, reference(score_mod, q).relu())
-        # GluonTemplate's default (False) keeps the relu in its own kernel.
+        # Disallowing epilogue fusion keeps the relu in its own kernel.
         self.assertEqual(
             "triton_poi_fused_relu" in code, allow_epilogue_fusion is False
         )
