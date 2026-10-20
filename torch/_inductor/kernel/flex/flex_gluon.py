@@ -18,8 +18,13 @@ from torch._inductor.virtualized import V
 from torch._logging import warning_once
 from torch.utils._triton import has_gluon
 
+from ... import config
 from ...codegen.gluon_template import GluonTemplate
-from ...select_algorithm import SymbolicGridFn
+from ...select_algorithm import (
+    autotune_select_algorithm,
+    NoValidChoicesError,
+    SymbolicGridFn,
+)
 from ...utils import get_num_sms
 from .common import load_flex_template
 from .flex_attention import log
@@ -27,6 +32,8 @@ from .flex_attention import log
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from ...ir import TensorBox
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,3 +205,34 @@ def append_gluon_flex_choices(
             log,
             "BACKEND='GLUON' has no valid Gluon config for these inputs; using the Triton template.",
         )
+
+
+def select_gluon_flex_choice(
+    choices: list[Any], layout, input_gen_fns: dict[int, Any]
+) -> TensorBox | None:
+    """Autotune the Gluon choices, or warn and return None if none of them
+    compiles so the caller builds Triton choices instead."""
+    try:
+        if len(choices) == 1 or config.deterministic:
+            # autotune_select_algorithm picks choices[0] without compiling it.
+            choices[0].precompile()
+    except Exception as e:
+        reason = f"its Gluon kernel failed to compile ({e})"
+    else:
+        try:
+            out, _ = autotune_select_algorithm(
+                "flex_attention",
+                choices,
+                list(choices[0].input_nodes),
+                layout,
+                input_gen_fns=input_gen_fns,
+            )
+            return out
+        except NoValidChoicesError:
+            reason = "every Gluon config failed to compile or benchmark"
+    warning_once(
+        log,
+        "BACKEND='GLUON' is unavailable because %s; using the Triton template.",
+        reason,
+    )
+    return None

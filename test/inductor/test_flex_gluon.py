@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 import torch
+import torch._inductor.codegen.gluon_template as gluon_template
 import torch._inductor.kernel.flex.flex_gluon as flex_gluon
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code, run_fw_bw_and_get_code
@@ -325,6 +326,34 @@ class TestFlexGluon(InductorTestCase):
         q, k, v = self._make_qkv(device, dtype, Hq=16, Hkv=16, S_q=256, S_kv=256)
         with mock.patch.object(flex_gluon, "_num_programs", return_value=8):
             self._assert_falls_back(q, k, v, "more query heads than the 8")
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    @parametrize("forced_block_n", [None, 64])
+    def test_fallback_compile_failure(self, device, dtype, forced_block_n):
+        # Two configs go through autotuning; a forced BLOCK_N leaves one, which
+        # autotuning would return without compiling.
+        q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256)
+        to_gluon = gluon_template.triton_to_gluon
+
+        def broken(code):
+            code = to_gluon(code)
+            return f"{code}\nundefined_name" if "post_mod_scores" in code else code
+
+        options = {"BACKEND": "GLUON"}
+        if forced_block_n is not None:
+            options["BLOCK_N"] = forced_block_n
+        fn = torch.compile(
+            lambda q, k, v: flex_attention(q, k, v, kernel_options=options)
+        )
+        with (
+            mock.patch.object(gluon_template, "triton_to_gluon", broken),
+            self.assertLogs(FLEX_LOGGER, level="WARNING") as logs,
+        ):
+            out, (code, *_) = run_and_get_code(fn, q, k, v)
+        self.assertNotIn("@gluon.jit", code)
+        self.assertIn("failed to compile", "\n".join(logs.output))
+        self.assertEqual(out, _compile_flex("TRITON")(q, k, v))
 
     @requires_gluon_template
     @dtypes(torch.bfloat16)

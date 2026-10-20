@@ -245,9 +245,13 @@ arch needs a fallback.
      leaves no layout-less `tl.*` op behind, so there is nothing to catch at
      render time. Render errors (`NotImplementedError`) are still caught by
      `maybe_append_choice` (`select_algorithm.py:2861`). For compile errors,
-     the lowering runs `autotune_select_algorithm` on the Gluon choices and,
-     if it raises `NoValidChoicesError` because every choice failed to
-     compile, falls back to the Triton choices with that error as the reason.
+     the lowering runs `autotune_select_algorithm` on the Gluon choices alone
+     (`select_gluon_flex_choice`, following `tuned_scaled_mm`'s NV Universal
+     GEMM fallback) and returns early on success. If it raises
+     `NoValidChoicesError` because every choice failed, the lowering falls
+     through to the Triton choices. A lone choice (e.g. a forced `BLOCK_N`) or
+     `config.deterministic` is picked without compiling, so that choice is
+     precompiled first and any error from it counts as a failure.
 - **Fallback.** On `None`, the lowering continues down the existing Triton
   forward path with the same `kernel_options` and warns once per reason, e.g.
   `BACKEND="GLUON" has no template for gfx942; using the Triton template`. A
@@ -306,9 +310,9 @@ fuses into the toy Gluon template and is numerically correct, because
    K/V staging, and keeps flex's semantics and two-pass block-sparse loop. It
    is non-persistent, with flex's grid. The Gluon branch sits just before the
    Triton config loop, so it reuses all of the lowering's setup. Fallback
-   layers 1 and 2 are implemented. Layer 3 (compile failure, via
-   `NoValidChoicesError`) is not yet: it needs the Triton choice loop
-   factored into a function.
+   layers 1 and 2 are implemented. Layer 3 (compile failure) followed in
+   milestone 4's cleanup; it did not need the Triton choice loop factored
+   out, since the Gluon branch sits before it and can fall through.
 
    Measured on MI350X, bf16 forward, both max-autotune, B*S = 16k, H = 16:
    Gluon is 1.04-1.13x the Triton template on causal and sliding-window
@@ -411,7 +415,8 @@ Fallback tests run on any GPU, without the arch skip:
 - Each layer falls back the same way on gfx950: a dynamic head dim (layer 1),
   an unsupported head dim or a forced `BLOCK_M` outside the config space
   (layer 2), and a `score_mod` whose Gluon kernel fails to compile (layer 3;
-  patch `triton_to_gluon` to the identity to force it).
+  patch `triton_to_gluon` to append an undefined name to the score_mod code),
+  both with two configs and with a forced `BLOCK_N` that leaves one.
 - A query shorter than 128 takes the Triton decode kernel (`SPLIT_KV` in the
   generated code, no `@gluon.jit`) and warns.
 - On gfx950 with supported inputs, the generated code does contain
