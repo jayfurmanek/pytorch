@@ -190,6 +190,49 @@ class TestFlexGluon(InductorTestCase):
 
     @requires_gluon_template
     @dtypes(torch.bfloat16)
+    @parametrize(
+        "shape",
+        [(1, 1, 256), (8, 64, 512), (3, 5, 777)],
+        name_fn=lambda s: "B{}_H{}_S{}".format(*s),
+    )
+    def test_persistent_schedule(self, device, dtype, shape):
+        # Fewer work items than programs, many more, and an uneven split across
+        # batch groups and query slots.
+        B, H, S = shape
+        q, k, v = self._make_qkv(device, dtype, B=B, Hq=H, Hkv=H, S_q=S, S_kv=S, D=64)
+        self._gluon_vs_triton(q, k, v, mask_mod=_causal)
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    @parametrize("score_mod_name", ["none", "rel_bias"])
+    def test_negative_scale(self, device, dtype, score_mod_name):
+        # The softmax scales the row max instead of each score, which is only
+        # exact for a positive scale.
+        q, k, v = self._make_qkv(device, dtype, S_q=512, S_kv=512)
+        mod = {"none": None, "rel_bias": _rel_bias}[score_mod_name]
+        self._gluon_vs_triton(q, k, v, score_mod=mod, mask_mod=_causal, scale=-0.1)
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
+    def test_blocks_are_contiguous(self, device, dtype):
+        q, k, v = self._make_qkv(device, dtype)
+        block_mask = create_block_mask(_causal, 2, 4, 1024, 1024, device=device)
+        options = {"BLOCKS_ARE_CONTIGUOUS": True}
+
+        def fn(backend):
+            kernel_options = {"BACKEND": backend, **options}
+            return torch.compile(
+                lambda q, k, v: flex_attention(
+                    q, k, v, block_mask=block_mask, kernel_options=kernel_options
+                )
+            )
+
+        out, (code, *_) = run_and_get_code(fn("GLUON"), q, k, v)
+        self.assertIn("@gluon.jit", code)
+        self.assertEqual(out, fn("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
     def test_lse_and_max(self, device, dtype):
         q, k, v = self._make_qkv(device, dtype, S_q=1000, S_kv=1000)
         self._gluon_vs_triton(

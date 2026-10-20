@@ -19,8 +19,9 @@ from torch._logging import warning_once
 from torch.utils._triton import has_gluon
 
 from ...codegen.gluon_template import GluonTemplate
+from ...select_algorithm import SymbolicGridFn
 from .common import load_flex_template
-from .flex_attention import flex_attention_grid, log
+from .flex_attention import log
 
 
 if TYPE_CHECKING:
@@ -32,6 +33,13 @@ class GluonFlexConfig:
     block_m: int
     block_n: int
     num_warps: int
+    # Persistent programs launched per CU.
+    programs_per_cu: int = 2
+
+
+@SymbolicGridFn
+def persistent_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv):
+    return (meta["NUM_PROGRAMS"], 1, 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,6 +48,8 @@ class GluonFlexTemplateSpec:
     head_dims: tuple[int, ...]
     dtypes: tuple[torch.dtype, ...]
     configs: tuple[GluonFlexConfig, ...]
+    # XCDs that workgroups are dispatched round-robin across.
+    num_xcds: int
     # Template-specific constraints beyond head dim and dtype; returns a reason or None.
     check: Callable[[Any, Any, Any, dict[str, Any]], str | None] | None = None
 
@@ -47,14 +57,19 @@ class GluonFlexTemplateSpec:
 _GFX950_SPEC = GluonFlexTemplateSpec(
     template=GluonTemplate(
         name="gluon_flex_attention_gfx950",
-        grid=flex_attention_grid,
+        grid=persistent_grid,
         source=load_flex_template("gluon_flex_attention_gfx950"),
         always_freeze_layout=True,
     ),
     head_dims=(64, 128),
     dtypes=(torch.float16, torch.bfloat16),
     # The [32, 32, 16] MFMA tiles BLOCK_M over num_warps warps of 32 rows each.
-    configs=(GluonFlexConfig(128, 64, 4), GluonFlexConfig(128, 32, 4)),
+    configs=tuple(
+        GluonFlexConfig(128, block_n, 4, programs_per_cu)
+        for block_n in (64, 32)
+        for programs_per_cu in (2, 3, 4)
+    ),
+    num_xcds=8,
 )
 
 # Keyed by base arch, e.g. "gfx950" for "gfx950:sramecc+:xnack-".
@@ -78,6 +93,11 @@ def _offsets_fit_int32(node) -> bool:
     _, _, stride_seq, stride_d = node.get_stride()
     extent = (seq_len - 1) * stride_seq + (head_dim - 1) * stride_d
     return V.graph.sizevars.guard_or_false(sympy.Le(extent, _INT32_MAX))
+
+
+def _num_programs(query, spec: GluonFlexTemplateSpec, conf: GluonFlexConfig) -> int:
+    num_cus = torch.cuda.get_device_properties(query.get_device()).multi_processor_count
+    return conf.programs_per_cu * num_cus // spec.num_xcds * spec.num_xcds
 
 
 def _get_gluon_spec(
@@ -109,6 +129,9 @@ def _get_gluon_spec(
         return None, "the head dim of Q, K and V must be contiguous"
     if not all(_offsets_fit_int32(n) for n in (query, key, value)):
         return None, "a (batch, head) slice of Q, K or V exceeds 32-bit offsets"
+    num_programs = min(_num_programs(query, spec, c) for c in spec.configs)
+    if not sizevars.guard_or_false(sympy.Le(query.get_size()[1], num_programs)):
+        return None, f"more query heads than the {num_programs} persistent programs"
     if kernel_options.get("USE_TMA"):
         return None, "USE_TMA is not supported"
     if not any(_matches_forced_options(c, kernel_options) for c in spec.configs):
@@ -129,6 +152,7 @@ def append_gluon_flex_choices(
     kernel_options: dict[str, Any],
     sparse_q_block_size: int,
     sparse_kv_block_size: int,
+    score_mod_is_identity: bool,
     **choice_kwargs: Any,
 ) -> None:
     """Append Gluon forward choices, or warn and leave `choices` empty so the
@@ -162,6 +186,9 @@ def append_gluon_flex_choices(
         options["USE_TMA"] = False
         options["SPARSE_Q_BLOCK_SIZE"] = sparse_q_block_size
         options["SPARSE_KV_BLOCK_SIZE"] = sparse_kv_block_size
+        options["NUM_PROGRAMS"] = _num_programs(query, spec, conf)
+        options["NUM_XCDS"] = spec.num_xcds
+        options["SCORE_MOD_IS_IDENTITY"] = score_mod_is_identity
         error = spec.template.maybe_append_choice(
             choices=choices, **choice_kwargs, **options
         )

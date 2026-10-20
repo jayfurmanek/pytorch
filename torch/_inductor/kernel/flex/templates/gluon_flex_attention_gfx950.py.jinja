@@ -6,6 +6,9 @@ softmax runs in base 2, LSE and MAX are stored in log2 units, and the
 block-sparse loop visits partial blocks (score_mod + mask_mod) and then full
 blocks (score_mod only).
 
+The kernel is persistent: NUM_PROGRAMS programs loop over (batch, head, query
+block) work items in a swizzled order (see the scheduler comment below).
+
 The MFMA/dot-operand layouts, padded shared layouts and async K/V staging are
 adapted from the gfx950 Gluon MHA prefill kernel in tokenspeed
 (https://github.com/lightseekorg/tokenspeed, tokenspeed-kernel-amd), used under
@@ -35,6 +38,7 @@ SOFTWARE.
     gl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
     gl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
     gl.static_assert(QK_HEAD_DIM == V_HEAD_DIM)
+    gl.static_assert(NUM_PROGRAMS % NUM_XCDS == 0)
 
     stride_qz, stride_qh, stride_qm, stride_qk = {{stride("Q")}}
     stride_kz, stride_kh, stride_kn, stride_kk = {{stride("K")}}
@@ -47,6 +51,17 @@ SOFTWARE.
     KV_LEN = {{size("K", 2)}}
 
     RCP_LN2: gl.constexpr = 1.44269504
+    # With no score_mod nothing observes the scaled score, so SM_SCALE can be
+    # folded into SCORE_SCALE, but only when positive: the softmax scales the row
+    # max instead of every score.
+    FOLD_SM_SCALE: gl.constexpr = SCORE_MOD_IS_IDENTITY and not PRESCALE_QK and SM_SCALE > 0
+    # Factor from post-mod scores to log2 softmax units.
+    if PRESCALE_QK:
+        SCORE_SCALE: gl.constexpr = 1.0
+    elif FOLD_SM_SCALE:
+        SCORE_SCALE: gl.constexpr = SM_SCALE * RCP_LN2
+    else:
+        SCORE_SCALE: gl.constexpr = RCP_LN2
     HEAD_DIM: gl.constexpr = QK_HEAD_DIM
     MFMA: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[32, 32, 16], transposed=True, warps_per_cta=[gl.num_warps(), 1]
@@ -64,166 +79,200 @@ SOFTWARE.
     ROW: gl.constexpr = gl.SliceLayout(1, MFMA)
     COL: gl.constexpr = gl.SliceLayout(0, MFMA)
 
-    q_start = gl.program_id(0).to(INDEX_DTYPE)
-    off_zq = gl.program_id(1).to(INDEX_DTYPE)
-    off_hq = gl.program_id(2).to(INDEX_DTYPE)
-    off_zkv = off_zq % ZKV
-    off_hkv = off_hq // GQA_SHARED_HEADS
-
-    # Buffer ops take 32-bit offsets from a base pointer; the lowering guards
-    # that one (batch, head) slice of Q/K/V fits.
-    Q = Q + off_zq * stride_qz + off_hq * stride_qh
-    K = K + off_zkv * stride_kz + off_hkv * stride_kh
-    V = V + off_zkv * stride_vz + off_hkv * stride_vh
-
     SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}
     SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
     SPARSE_Q_MULTIPLE: gl.constexpr = SPARSE_Q_BLOCK_SIZE // BLOCK_M
     SPARSE_KV_MULTIPLE: gl.constexpr = SPARSE_KV_BLOCK_SIZE // BLOCK_N
-    sparse_hz_offset = (off_zq % SPARSE_Z) * SPARSE_HQ + off_hq % SPARSE_HQ
-    sparse_q_block = q_start // SPARSE_Q_MULTIPLE
-
-    offs_m = q_start * BLOCK_M + gl.arange(0, BLOCK_M, layout=ROW)
-    q_offs_m = q_start * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_DOT))
-    q_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, Q_DOT))
-    q_offsets = (q_offs_m[:, None] * stride_qm + q_offs_d[None, :]).to(gl.int32)
-    if IS_DIVISIBLE:
-        q = gl.amd.cdna4.buffer_load(Q, q_offsets)
-    else:
-        q = gl.amd.cdna4.buffer_load(Q, q_offsets, mask=q_offs_m[:, None] < Q_LEN, other=0.0)
-    if PRESCALE_QK:
-        q = (q * SM_SCALE * RCP_LN2).to(Q.dtype.element_ty)
 
     kv_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD))
     kv_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, LOAD))
+    # Loop-invariant tile offsets; each KV tile adds its start row.
+    k_tile_offsets = (kv_offs_n[:, None] * stride_kn + kv_offs_d[None, :]).to(gl.int32)
+    v_tile_offsets = (kv_offs_n[:, None] * stride_vn + kv_offs_d[None, :]).to(gl.int32)
     k_smem = gl.allocate_shared_memory(K.dtype.element_ty, [BLOCK_N, HEAD_DIM], K_SMEM)
     v_smem = gl.allocate_shared_memory(V.dtype.element_ty, [BLOCK_N, HEAD_DIM], V_SMEM)
 
-    m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, layout=ROW)
-    l_i = gl.full([BLOCK_M], 0.0, gl.float32, layout=ROW)
-    acc = gl.zeros([BLOCK_M, HEAD_DIM], gl.float32, layout=MFMA)
+    # ~~~~~~~~~~~~~~ persistent scheduler ~~~~~~~~~~~~~~
+    # Workgroups are dispatched round-robin over XCDs; remap so consecutive
+    # logical ids share an XCD (and its L2). Each program owns a fixed
+    # (batch slot, head, q slot) and walks q cycles; q slots alternate
+    # direction per cycle so causal's cheap and expensive query blocks are
+    # spread evenly across programs:
+    #   q_slots = 4: cycle 0 -> q blocks 0,1,2,3; cycle 1 -> 7,6,5,4; ...
+    # The lowering guarantees HQ <= NUM_PROGRAMS.
+    pid = gl.program_id(0)
+    logical_pid = (pid % NUM_XCDS) * (NUM_PROGRAMS // NUM_XCDS) + pid // NUM_XCDS
+    num_q_blocks = (Q_LEN + BLOCK_M - 1) // BLOCK_M
+    batch_slots = gl.minimum(ZQ, NUM_PROGRAMS // HQ)
+    q_slots = NUM_PROGRAMS // (batch_slots * HQ)
+    q_cycles = (num_q_blocks + q_slots - 1) // q_slots
+    num_work = gl.where(logical_pid < batch_slots * HQ * q_slots, (ZQ + batch_slots - 1) // batch_slots * q_cycles, 0)
+    q_slot = logical_pid % q_slots
+    off_hq = ((logical_pid // q_slots) % HQ).to(INDEX_DTYPE)
+    batch_slot = logical_pid // q_slots // HQ
+    off_hkv = off_hq // GQA_SHARED_HEADS
 
-    m = offs_m[:, None]
-    if not IS_DIVISIBLE:
-        m = m % Q_LEN
+    for work in range(0, num_work):
+        batch_group = work // q_cycles
+        q_cycle = work - batch_group * q_cycles
+        q_start = gl.where(q_cycle % 2 == 0, q_cycle * q_slots + q_slot, q_cycle * q_slots + q_slots - 1 - q_slot).to(INDEX_DTYPE)
+        off_zq = (batch_group * batch_slots + batch_slot).to(INDEX_DTYPE)
+        if (q_start < num_q_blocks) & (off_zq < ZQ):
+            off_zkv = off_zq % ZKV
+            # Buffer ops take 32-bit offsets from a base pointer; the lowering
+            # guards that one (batch, head) slice of Q/K/V fits.
+            q_base = Q + off_zq * stride_qz + off_hq * stride_qh
+            k_base = K + off_zkv * stride_kz + off_hkv * stride_kh
+            v_base = V + off_zkv * stride_vz + off_hkv * stride_vh
+            sparse_hz_offset = (off_zq % SPARSE_Z) * SPARSE_HQ + off_hq % SPARSE_HQ
+            sparse_q_block = q_start // SPARSE_Q_MULTIPLE
+
+            offs_m = q_start * BLOCK_M + gl.arange(0, BLOCK_M, layout=ROW)
+            q_offs_m = q_start * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_DOT))
+            q_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, Q_DOT))
+            q_offsets = (q_offs_m[:, None] * stride_qm + q_offs_d[None, :]).to(gl.int32)
+            if IS_DIVISIBLE:
+                q = gl.amd.cdna4.buffer_load(q_base, q_offsets)
+            else:
+                q = gl.amd.cdna4.buffer_load(q_base, q_offsets, mask=q_offs_m[:, None] < Q_LEN, other=0.0)
+            if PRESCALE_QK:
+                q = (q * SM_SCALE * RCP_LN2).to(Q.dtype.element_ty)
+
+            m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, layout=ROW)
+            l_i = gl.full([BLOCK_M], 0.0, gl.float32, layout=ROW)
+            acc = gl.zeros([BLOCK_M, HEAD_DIM], gl.float32, layout=MFMA)
+
+            m = offs_m[:, None]
+            if not IS_DIVISIBLE:
+                m = m % Q_LEN
 {%- for is_full_blocks in ([False, True] if HAS_FULL_BLOCKS else [False]) %}
 {%- set prefix = "FULL_" if is_full_blocks else "" %}
 
-    # ~~~~~~~~~~~~~~ {{ "full blocks: score_mod only" if is_full_blocks else "partial blocks: score_mod and mask_mod" }} ~~~~~~~~~~~~~~
-    kv_indices = {{prefix}}KV_IDX + sparse_hz_offset * {{stride(prefix ~ "KV_IDX", 1)}} + sparse_q_block * {{stride(prefix ~ "KV_IDX", 2)}}
-    kv_num_blocks = gl.load({{prefix}}KV_NUM_BLKS + sparse_hz_offset * {{stride(prefix ~ "KV_NUM_BLKS", 1)}} + sparse_q_block)
-    kv_start = gl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
-    block_n_end = gl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, gl.maximum((KV_LEN + BLOCK_N - 1) // BLOCK_N, 1))
+            # ~~~~~~~~~~~~~~ {{ "full blocks: score_mod only" if is_full_blocks else "partial blocks: score_mod and mask_mod" }} ~~~~~~~~~~~~~~
+            kv_indices = {{prefix}}KV_IDX + sparse_hz_offset * {{stride(prefix ~ "KV_IDX", 1)}} + sparse_q_block * {{stride(prefix ~ "KV_IDX", 2)}}
+            kv_num_blocks = gl.load({{prefix}}KV_NUM_BLKS + sparse_hz_offset * {{stride(prefix ~ "KV_NUM_BLKS", 1)}} + sparse_q_block)
+            first_kv_start = gl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
+            block_n_end = gl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, gl.maximum((KV_LEN + BLOCK_N - 1) // BLOCK_N, 1))
 
-    for start_n in range(0, block_n_end):
-        load_n = kv_start + kv_offs_n
-        k_offsets = (load_n[:, None] * stride_kn + kv_offs_d[None, :]).to(gl.int32)
-        v_offsets = (load_n[:, None] * stride_vn + kv_offs_d[None, :]).to(gl.int32)
-        if IS_DIVISIBLE:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(k_smem, K, k_offsets)
-            gl.amd.cdna4.async_copy.commit_group()
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(v_smem, V, v_offsets)
-            gl.amd.cdna4.async_copy.commit_group()
-        else:
-            load_mask = load_n[:, None] < KV_LEN
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(k_smem, K, k_offsets, mask=load_mask, other=0.0)
-            gl.amd.cdna4.async_copy.commit_group()
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(v_smem, V, v_offsets, mask=load_mask, other=0.0)
-            gl.amd.cdna4.async_copy.commit_group()
+            next_kv_start = first_kv_start
+            for start_n in range(0, block_n_end):
+                kv_start = next_kv_start
+                # Prefetch the next tile's block index. It is a vector load that shares
+                # vmcnt with the async K/V copies, so it is issued before them, and
+                # it is unmasked (index clamped instead) so LLVM does not turn it into
+                # a branch that loads and waits at the end of the iteration.
+                next_n = start_n + 1
+                if BLOCKS_ARE_CONTIGUOUS:
+                    next_kv_start = first_kv_start + next_n * BLOCK_N
+                else:
+                    next_block = gl.load(kv_indices + gl.minimum(next_n, block_n_end - 1) // SPARSE_KV_MULTIPLE)
+                    next_kv_start = next_block * SPARSE_KV_BLOCK_SIZE + (next_n % SPARSE_KV_MULTIPLE) * BLOCK_N
+                # kv_start is applied to the vector offsets rather than the scalar
+                # base pointer: moving a loaded value into an SGPR forces an
+                # immediate wait on it (and on everything before it in vmcnt).
+                k_offsets = k_tile_offsets + (kv_start * stride_kn).to(gl.int32)
+                v_offsets = v_tile_offsets + (kv_start * stride_vn).to(gl.int32)
+                if IS_DIVISIBLE:
+                    gl.amd.cdna4.async_copy.buffer_load_to_shared(k_smem, k_base, k_offsets)
+                    gl.amd.cdna4.async_copy.commit_group()
+                    gl.amd.cdna4.async_copy.buffer_load_to_shared(v_smem, v_base, v_offsets)
+                    gl.amd.cdna4.async_copy.commit_group()
+                else:
+                    load_mask = (kv_start + kv_offs_n)[:, None] < KV_LEN
+                    gl.amd.cdna4.async_copy.buffer_load_to_shared(k_smem, k_base, k_offsets, mask=load_mask, other=0.0)
+                    gl.amd.cdna4.async_copy.commit_group()
+                    gl.amd.cdna4.async_copy.buffer_load_to_shared(v_smem, v_base, v_offsets, mask=load_mask, other=0.0)
+                    gl.amd.cdna4.async_copy.commit_group()
 
-        gl.amd.cdna4.async_copy.wait_group(1)
-        k = k_smem.permute([1, 0]).load(K_DOT)
-        qk = gl.amd.cdna4.mfma(q, k, gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=MFMA))
-        if not PRESCALE_QK:
-            qk *= SM_SCALE
+                gl.amd.cdna4.async_copy.wait_group(1)
+                k = k_smem.permute([1, 0]).load(K_DOT)
+                qk = gl.amd.cdna4.mfma(q, k, gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=MFMA))
+                if not PRESCALE_QK and not FOLD_SM_SCALE:
+                    qk *= SM_SCALE
 
-        offs_n = kv_start + gl.arange(0, BLOCK_N, layout=COL)
-        n = offs_n[None, :]
-        if not IS_DIVISIBLE:
-            n = n % KV_LEN
-        {{ modification(
-            subgraph_number=0,
-            output_name="post_mod_scores",
-            score="qk",
-            b="off_zq",
-            h="off_hq",
-            m="m",
-            n="n",
-            out="qk",
-            input_shapes={
-                "score": ("BLOCK_M", "BLOCK_N"),
-                "m": ("BLOCK_M", "1"),
-                "n": ("1", "BLOCK_N"),
-            },
-            input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"},
-        ) | indent_except_first(2) }}
-        if not IS_DIVISIBLE:
-            post_mod_scores = gl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
+                offs_n = kv_start + gl.arange(0, BLOCK_N, layout=COL)
+                n = offs_n[None, :]
+                if not IS_DIVISIBLE:
+                    n = n % KV_LEN
+                {{ modification(
+                    subgraph_number=0,
+                    output_name="post_mod_scores",
+                    score="qk",
+                    b="off_zq",
+                    h="off_hq",
+                    m="m",
+                    n="n",
+                    out="qk",
+                    input_shapes={
+                        "score": ("BLOCK_M", "BLOCK_N"),
+                        "m": ("BLOCK_M", "1"),
+                        "n": ("1", "BLOCK_N"),
+                    },
+                    input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"},
+                ) | indent_except_first(4) }}
+                if not IS_DIVISIBLE:
+                    post_mod_scores = gl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
 {%- if not is_full_blocks %}
-        {{ modification(
-            subgraph_number=1,
-            output_name="mask_mod_output",
-            score="qk",
-            b="off_zq",
-            h="off_hq",
-            m="m",
-            n="n",
-            input_shapes={
-                "score": ("BLOCK_M", "BLOCK_N"),
-                "m": ("BLOCK_M", "1"),
-                "n": ("1", "BLOCK_N"),
-            },
-            input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"},
-        ) | indent_except_first(2) }}
-        post_mod_scores = gl.where(mask_mod_output, post_mod_scores, float("-inf"))
+                {{ modification(
+                    subgraph_number=1,
+                    output_name="mask_mod_output",
+                    score="qk",
+                    b="off_zq",
+                    h="off_hq",
+                    m="m",
+                    n="n",
+                    input_shapes={
+                        "score": ("BLOCK_M", "BLOCK_N"),
+                        "m": ("BLOCK_M", "1"),
+                        "n": ("1", "BLOCK_N"),
+                    },
+                    input_dtypes={"b": "index", "h": "index", "m": "index", "n": "index"},
+                ) | indent_except_first(4) }}
+                post_mod_scores = gl.where(mask_mod_output, post_mod_scores, float("-inf"))
 {%- endif %}
-        if not PRESCALE_QK:
-            post_mod_scores *= RCP_LN2
+                # post_mod_scores * SCORE_SCALE is in log2 units. Scaling the row
+                # max rather than every score is exact (rounding is monotonic for a
+                # positive scale) and lets the scale fuse into the exp2 argument.
+                m_ij = gl.maximum(m_i, gl.max(post_mod_scores, 1) * SCORE_SCALE)
+                if not ROWS_GUARANTEED_SAFE:
+                    m_ij_masked = gl.where(m_ij == float("-inf"), 0.0, m_ij)
+                else:
+                    m_ij_masked = m_ij
+                alpha = gl.exp2(m_i - m_ij_masked)
+                p = gl.exp2(post_mod_scores * SCORE_SCALE - m_ij_masked[:, None])
+                l_i = l_i * alpha + gl.sum(p, 1)
+                acc = acc * alpha[:, None]
+                p = gl.convert_layout(p.to(V.dtype.element_ty), P_DOT)
 
-        m_ij = gl.maximum(m_i, gl.max(post_mod_scores, 1))
-        if not ROWS_GUARANTEED_SAFE:
-            m_ij_masked = gl.where(m_ij == float("-inf"), 0.0, m_ij)
-        else:
-            m_ij_masked = m_ij
-        alpha = gl.exp2(m_i - m_ij_masked)
-        p = gl.exp2(post_mod_scores - m_ij_masked[:, None])
-        l_i = l_i * alpha + gl.sum(p, 1)
-        acc = acc * alpha[:, None]
-        p = gl.convert_layout(p.to(V.dtype.element_ty), P_DOT)
-
-        gl.amd.cdna4.async_copy.wait_group(0)
-        v = v_smem.load(V_DOT)
-        acc = gl.amd.cdna4.mfma(p, v, acc)
-        m_i = m_ij
-
-        kv_start += get_offset_for_next_block(
-            start_n, kv_indices, kv_num_blocks, SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
-        )
+                gl.amd.cdna4.async_copy.wait_group(0)
+                v = v_smem.load(V_DOT)
+                acc = gl.amd.cdna4.mfma(p, v, acc)
+                m_i = m_ij
 {%- endfor %}
 
-    # Fully masked rows have l_i == 0 and m_i == -inf; l_i = 1 makes out = 0 and lse = -inf.
-    l_i = gl.where(l_i == 0.0, 1.0, l_i)
-    acc = acc / l_i[:, None]
+            # Fully masked rows have l_i == 0 and m_i == -inf; l_i = 1 makes out = 0 and lse = -inf.
+            l_i = gl.where(l_i == 0.0, 1.0, l_i)
+            acc = acc / l_i[:, None]
 
-    idx_zq = off_zq
-    idx_hq = off_hq
-    idx_m = offs_m[:, None]
-    idx_d = gl.arange(0, HEAD_DIM, layout=COL)[None, :]
-    mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
-    {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", val_shape=("BLOCK_M", "V_HEAD_DIM"))}}
+            idx_zq = off_zq
+            idx_hq = off_hq
+            idx_m = offs_m[:, None]
+            idx_d = gl.arange(0, HEAD_DIM, layout=COL)[None, :]
+            mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
+            {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", indent_width=12, val_shape=("BLOCK_M", "V_HEAD_DIM"))}}
 
-    off_hz = off_zq * HQ + off_hq
-    if OUTPUT_LOGSUMEXP:
-        lse = m_i + gl.log2(l_i)
-        if IS_DIVISIBLE:
-            gl.store(LSE + off_hz * Q_LEN + offs_m, lse)
-        else:
-            gl.store(LSE + off_hz * Q_LEN + offs_m, lse, mask=offs_m < Q_LEN)
-    if OUTPUT_MAX:
-        if IS_DIVISIBLE:
-            gl.store(MAX + off_hz * Q_LEN + offs_m, m_i)
-        else:
-            gl.store(MAX + off_hz * Q_LEN + offs_m, m_i, mask=offs_m < Q_LEN)
+            off_hz = off_zq * HQ + off_hq
+            if OUTPUT_LOGSUMEXP:
+                lse = m_i + gl.log2(l_i)
+                if IS_DIVISIBLE:
+                    gl.store(LSE + off_hz * Q_LEN + offs_m, lse)
+                else:
+                    gl.store(LSE + off_hz * Q_LEN + offs_m, lse, mask=offs_m < Q_LEN)
+            if OUTPUT_MAX:
+                if IS_DIVISIBLE:
+                    gl.store(MAX + off_hz * Q_LEN + offs_m, m_i)
+                else:
+                    gl.store(MAX + off_hz * Q_LEN + offs_m, m_i, mask=offs_m < Q_LEN)
 
 
 @gluon.constexpr_function
@@ -235,19 +284,3 @@ def padded_shared_layout(operand_layout, shape, dtype, is_k_contig):
     )
     ((interval, padding),) = layout.interval_padding_pairs
     return gl.PaddedSharedLayout.with_identity_for([[int(interval), int(padding)]], shape, [1, 0])
-
-
-@gluon.jit
-def get_offset_for_next_block(
-    loop_iter, col_indices, total_blocks,
-    SPARSE_BLOCK, SPARSE_BLOCK_MULTIPLE, BLOCK,
-    BLOCKS_ARE_CONTIGUOUS: gl.constexpr
-):
-    if BLOCKS_ARE_CONTIGUOUS:
-        return BLOCK
-    cur_block_idx = loop_iter // SPARSE_BLOCK_MULTIPLE
-    cur_block = gl.load(col_indices + cur_block_idx)
-    next_block = gl.load(col_indices + cur_block_idx + 1, mask=cur_block_idx + 1 < total_blocks)
-    needs_jump = (loop_iter + 1) % SPARSE_BLOCK_MULTIPLE == 0
-    jump_to_block = (next_block - cur_block) * SPARSE_BLOCK - (SPARSE_BLOCK_MULTIPLE - 1) * BLOCK
-    return jump_to_block * needs_jump + (1 - needs_jump) * BLOCK
