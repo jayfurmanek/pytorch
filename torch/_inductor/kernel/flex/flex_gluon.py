@@ -35,7 +35,7 @@ class GluonFlexConfig:
     block_n: int
     num_warps: int
     # Persistent programs launched per CU.
-    programs_per_cu: int = 2
+    programs_per_cu: int
 
 
 @SymbolicGridFn
@@ -65,11 +65,10 @@ _GFX950_SPEC = GluonFlexTemplateSpec(
     head_dims=(64, 128),
     dtypes=(torch.float16, torch.bfloat16),
     # The [32, 32, 16] MFMA tiles BLOCK_M over num_warps warps of 32 rows each.
-    configs=tuple(
-        GluonFlexConfig(128, block_n, 4, programs_per_cu)
-        for block_n in (64, 32)
-        for programs_per_cu in (2, 3, 4)
-    ),
+    # BLOCK_N = 32 wins causal D = 128 and 64 wins the rest. 4 programs per CU
+    # was best or within 2% on every MI350X shape benchmarked; 2 and 3 were not
+    # worth autotuning.
+    configs=(GluonFlexConfig(128, 64, 4, 4), GluonFlexConfig(128, 32, 4, 4)),
     num_xcds=8,
 )
 
