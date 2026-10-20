@@ -310,6 +310,13 @@ class TestFlexGluon(InductorTestCase):
 
     @requires_gluon_template
     @dtypes(torch.bfloat16)
+    def test_fallback_more_heads_than_programs(self, device, dtype):
+        q, k, v = self._make_qkv(device, dtype, Hq=16, Hkv=16, S_q=256, S_kv=256)
+        with mock.patch.object(flex_gluon, "_num_programs", return_value=8):
+            self._assert_falls_back(q, k, v, "more query heads than the 8")
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
     def test_fallback_forced_block_size(self, device, dtype):
         q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256)
 
