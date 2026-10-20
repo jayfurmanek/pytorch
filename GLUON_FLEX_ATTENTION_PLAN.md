@@ -334,8 +334,12 @@ fuses into the toy Gluon template and is numerically correct, because
      tokenspeed. Turning tokenspeed's own swizzle off dropped it below Gluon
      v1, which is how this was identified. Slot counts are computed at run
      time because flex's batch and head counts can be dynamic;
-     `NUM_PROGRAMS` (2, 3 or 4 per CU) is autotuned, and 4 per CU won
-     everywhere.
+     `NUM_PROGRAMS` is 4 per CU. Autotuning 2, 3 and 4 per CU over 30 MI350X
+     shapes (causal and sliding window, D = 64 and 128, S = 1k-16k, H = 32 /
+     Hkv = 8 and H = 16) found 4 per CU best or within 2% everywhere, and 3 per
+     CU 8-54% slower: the slot counts round down, so with 768 programs and,
+     e.g., B = 16, H = 32 only 512 get work. Only `BLOCK_N` (64 or 32) is
+     autotuned now; 32 wins causal D = 128 by 8-17%, 64 wins everything else.
    - **One scale multiply per score** (about +10-17% at long S): the scale is
      folded into a single constexpr `SCORE_SCALE` applied inside the exp2
      argument (fusing into an FMA) and to the row max rather than to every
