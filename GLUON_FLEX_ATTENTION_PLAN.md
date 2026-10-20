@@ -23,7 +23,7 @@ Non-goals for the first iteration:
 - Gluon decode. Short queries take the Triton decode kernel (see "Arch dispatch
   and fallback").
 - Epilogue or prologue fusion into the Gluon template.
-- Auto-selection under `BACKEND="AUTO"`.
+- Auto-selection under `BACKEND="AUTO"` by default (it is opt-in; see milestone 5).
 
 ## Findings that shape the design
 
@@ -196,9 +196,14 @@ Range-tree `tl.arange` only matters for epilogue fusion and the TMA
     path into a helper, rather than duplicating it.
 - Backward: no change. The `flex_attention_backward` HOP receives Gluon's
   out/LSE and runs the Triton backward template.
-- Later, opt-in auto-selection: register Gluon choices through
-  `InductorChoices.append_flex_attention_choices` (`choices.py:189`) so they
-  compete with Triton under `AUTO` + max-autotune, behind a config flag.
+- Opt-in auto-selection (milestone 5): with `max_autotune` and
+  `config.max_autotune_flex_gluon` (`TORCHINDUCTOR_MAX_AUTOTUNE_FLEX_GLUON=1`),
+  `AUTO` adds the Gluon choices to the Triton choices so they compete in one
+  autotune. They are added in the lowering rather than through
+  `InductorChoices.append_flex_attention_choices`: that hook is a no-op meant
+  for subclasses to replace (an override would drop Gluon), and it lacks
+  what the Gluon choices need (`score_mod_is_identity`, `mutated_inputs`,
+  `call_sizes`).
 
 ### Arch dispatch and fallback
 
@@ -263,9 +268,9 @@ arch needs a fallback.
   take the Triton decode kernel under `BACKEND="GLUON"` as under `AUTO`, with a
   one-time warning. Otherwise a 1-row query would pad to a 128-row Gluon tile
   with no split over KV.
-- **AUTO, later.** `append_flex_attention_choices` simply adds no Gluon choices
-  when the lookup returns `None`. No warning in that case, since the user didn't
-  ask for Gluon.
+- **AUTO.** When Gluon is unusable, `AUTO` adds no Gluon choices and does not
+  warn, since the user didn't ask for Gluon. A Gluon choice that fails to
+  compile just loses autotuning.
 - **Caching.** The choice is made at compile time from the compile device's
   arch. Check that the FX graph cache and autotune cache keys include the arch
   (they should via the device properties in the system key), so that an
@@ -384,11 +389,26 @@ fuses into the toy Gluon template and is numerically correct, because
    reuses stale kernels. Always benchmark template edits with a fresh
    `TORCHINDUCTOR_CACHE_DIR`. This is a pre-existing upstream issue that
    affects every Inductor Jinja template.
-5. **Optional**: gfx942 (a `cdna3` template plus a registry entry); AUTO selection via the choices hook; Gluon
-   backward; epilogue fusion; a Gluon split-KV template. Splitting KV across
-   programs when (batch, head, query block) work is scarce would serve both
-   decode (now routed to the Triton decode kernel) and small prefills, where
-   the persistent template trails Triton (see milestone 4).
+5. **Optional**: gfx942 (a `cdna3` template plus a registry entry); AUTO
+   selection; Gluon backward; epilogue fusion; a Gluon split-KV template.
+
+   AUTO selection is done, opt-in via `config.max_autotune_flex_gluon` (see
+   "Lowering changes"). On MI350X, bf16 causal, it picks Gluon for B = 16,
+   H = 32, S = 1k, D = 64 (189 vs 249 us) and B = 4, H = 32, S = 4k, D = 64
+   (480 vs 792 us), and Triton for the small B = 2, H = 16, S = 1k, D = 128
+   (40 vs 60 us). It misses B = 1, H = 16, S = 16k, D = 128: Triton is picked
+   at 1954 us although Gluon runs in 1656 us. Flex autotuning replaces the
+   block mask with a fake one in which every query block visits
+   `min(16, num_kv_blocks)` KV blocks (`create_num_blocks_fake_generator`),
+   so it benchmarks a uniform 2048-key workload, not the causal one where the
+   persistent scheduler's load balancing pays off. This affects all flex
+   autotuning, not just Gluon; a more representative fake mask is a separate,
+   upstream change.
+
+   Split-KV: splitting KV across programs when (batch, head, query block)
+   work is scarce would serve both decode (now routed to the Triton decode
+   kernel) and small prefills, where the persistent template trails Triton
+   (see milestone 4).
 
 ## Testing
 
@@ -419,6 +439,9 @@ Fallback tests run on any GPU, without the arch skip:
   both with two configs and with a forced `BLOCK_N` that leaves one.
 - A query shorter than 128 takes the Triton decode kernel (`SPLIT_KV` in the
   generated code, no `@gluon.jit`) and warns.
+- `AUTO` with max-autotune benchmarks the Gluon configs alongside Triton's only
+  when `max_autotune_flex_gluon` is set, and stays silent when Gluon is
+  unsupported or fails to compile.
 - On gfx950 with supported inputs, the generated code does contain
   `@gluon.jit`, so that a silent fallback can't pass the numerics tests.
 

@@ -160,17 +160,14 @@ def append_gluon_flex_choices(
     sparse_kv_block_size: int,
     score_mod_is_identity: bool,
     **choice_kwargs: Any,
-) -> None:
-    """Append Gluon forward choices, or warn and leave `choices` empty so the
-    caller builds Triton choices instead."""
+) -> str | None:
+    """Append Gluon forward choices. If none can be appended, return the reason
+    and leave `choices` unchanged."""
     spec, reason = _get_gluon_spec(query, key, value, kernel_options)
     if spec is None:
-        warning_once(
-            log,
-            "BACKEND='GLUON' is unavailable because %s; using the Triton template.",
-            reason,
-        )
-        return
+        return reason
+
+    num_choices = len(choices)
 
     for conf in spec.configs:
         options = {
@@ -200,11 +197,9 @@ def append_gluon_flex_choices(
         )
         if error is not None:
             log.info("Gluon flex attention config %s rejected: %s", conf, error)
-    if not choices:
-        warning_once(
-            log,
-            "BACKEND='GLUON' has no valid Gluon config for these inputs; using the Triton template.",
-        )
+    if len(choices) == num_choices:
+        return "no Gluon config is valid for these inputs"
+    return None
 
 
 def select_gluon_flex_choice(
@@ -230,9 +225,13 @@ def select_gluon_flex_choice(
             return out
         except NoValidChoicesError:
             reason = "every Gluon config failed to compile or benchmark"
+    warn_gluon_fallback(reason)
+    return None
+
+
+def warn_gluon_fallback(reason: str) -> None:
     warning_once(
         log,
         "BACKEND='GLUON' is unavailable because %s; using the Triton template.",
         reason,
     )
-    return None
