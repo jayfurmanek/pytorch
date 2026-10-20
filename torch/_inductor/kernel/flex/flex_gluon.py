@@ -20,6 +20,7 @@ from torch.utils._triton import has_gluon
 
 from ...codegen.gluon_template import GluonTemplate
 from ...select_algorithm import SymbolicGridFn
+from ...utils import get_num_sms
 from .common import load_flex_template
 from .flex_attention import log
 
@@ -95,9 +96,8 @@ def _offsets_fit_int32(node) -> bool:
     return V.graph.sizevars.guard_or_false(sympy.Le(extent, _INT32_MAX))
 
 
-def _num_programs(query, spec: GluonFlexTemplateSpec, conf: GluonFlexConfig) -> int:
-    num_cus = torch.cuda.get_device_properties(query.get_device()).multi_processor_count
-    return conf.programs_per_cu * num_cus // spec.num_xcds * spec.num_xcds
+def _num_programs(spec: GluonFlexTemplateSpec, conf: GluonFlexConfig) -> int:
+    return conf.programs_per_cu * get_num_sms() // spec.num_xcds * spec.num_xcds
 
 
 def _get_gluon_spec(
@@ -129,7 +129,7 @@ def _get_gluon_spec(
         return None, "the head dim of Q, K and V must be contiguous"
     if not all(_offsets_fit_int32(n) for n in (query, key, value)):
         return None, "a (batch, head) slice of Q, K or V exceeds 32-bit offsets"
-    num_programs = min(_num_programs(query, spec, c) for c in spec.configs)
+    num_programs = min(_num_programs(spec, c) for c in spec.configs)
     if not sizevars.guard_or_false(sympy.Le(query.get_size()[1], num_programs)):
         return None, f"more query heads than the {num_programs} persistent programs"
     if kernel_options.get("USE_TMA"):
@@ -186,7 +186,7 @@ def append_gluon_flex_choices(
         options["USE_TMA"] = False
         options["SPARSE_Q_BLOCK_SIZE"] = sparse_q_block_size
         options["SPARSE_KV_BLOCK_SIZE"] = sparse_kv_block_size
-        options["NUM_PROGRAMS"] = _num_programs(query, spec, conf)
+        options["NUM_PROGRAMS"] = _num_programs(spec, conf)
         options["NUM_XCDS"] = spec.num_xcds
         options["SCORE_MOD_IS_IDENTITY"] = score_mod_is_identity
         error = spec.template.maybe_append_choice(
