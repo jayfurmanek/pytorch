@@ -16,7 +16,7 @@ from torch._inductor.virtualized import V
 from torch._logging import warning_once
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.nn.attention.flex_attention import _Backend
-from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import CeilDiv, FloorDiv
 
 from ... import config
 from ...ir import ComputedBuffer, ExternKernel, FixedLayout, TensorBox
@@ -125,9 +125,23 @@ def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv
     """How is this kernel parallelized?
     We create a grid of (ceil_div(n_queries, query_block_size), batch_size, num_heads)
     Each block is responsible for iterating over blocks of keys and values calculating
-    the final attention output.
+    the final attention output. With NUM_XCDS the grid is flattened so the kernel
+    can remap programs across XCDs.
     """
+    if "NUM_XCDS" in meta:
+        return (cdiv(num_queries, meta["BLOCK_M"]) * batch_size * q_heads, 1, 1)
     return (cdiv(num_queries, meta["BLOCK_M"]), batch_size, q_heads)
+
+
+# XCDs that workgroups are dispatched round-robin across, by base arch.
+_NUM_XCDS = {"gfx950": 8}
+
+
+def _default_num_xcds(device: torch.device) -> int | None:
+    if torch.version.hip is None or device.type != "cuda":
+        return None
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    return _NUM_XCDS.get(arch)
 
 
 def set_float32_precision(kernel_options: dict[str, Any], dtype: torch.dtype) -> None:
@@ -460,6 +474,7 @@ def flex_attention(
     SPARSE_Q_BLOCK_SIZE = V.graph.sizevars.guard_int(SPARSE_Q_BLOCK_SIZE)
 
     original_kernel_options = kernel_options.copy()
+    default_num_xcds = _default_num_xcds(query.get_device())
     # Default config for warp specialization
     num_consumer_groups, num_buffers_warp_spec = 0, 0
     invalid_block_options: dict[str, Any] | None = None
@@ -619,6 +634,14 @@ def flex_attention(
         for attrib in ["kpack", "matrix_instr_nonkdim", "waves_per_eu"]:
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        # HIP caps each grid dimension at 2**32 - 1 work items (64 per warp on
+        # CDNA), so only flatten the grid when it stays under that.
+        num_xcds = cur_kernel_options.pop("NUM_XCDS", default_num_xcds)
+        num_programs = CeilDiv(seq_len_q, cur_kernel_options["BLOCK_M"]) * Bq * Hq
+        work_items = num_programs * cur_kernel_options["num_warps"] * 64
+        if num_xcds and V.graph.sizevars.statically_known_leq(work_items, 2**32 - 1):
+            cur_kernel_options["NUM_XCDS"] = num_xcds
 
         error = flex_attention_template.maybe_append_choice(
             choices=choices,
