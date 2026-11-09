@@ -18,6 +18,7 @@ from torch.nn.attention.flex_attention import (
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
+    largeTensorTest,
 )
 from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.inductor_utils import HAS_GPU_AND_TRITON
@@ -439,6 +440,18 @@ class TestFlexGluon(InductorTestCase):
         q, k, v = self._make_qkv(device, dtype, Hq=16, Hkv=16, S_q=256, S_kv=256)
         with mock.patch.object(flex_gluon, "_num_programs", return_value=8):
             self._assert_falls_back(q, k, v, "more query heads than the 8")
+
+    @requires_gluon_template
+    @largeTensorTest("3GB")
+    @dtypes(torch.bfloat16)
+    def test_fallback_buffer_op_bytes(self, device, dtype):
+        # A (batch, head) slice of K/V spans fewer than 2**31 elements but more
+        # than 2**31 - 2 bytes, past the range of a buffer op.
+        S_kv = 65600
+        q = torch.randn(1, 1, 256, 64, device=device, dtype=dtype)
+        kv = torch.randn(1, S_kv, 256, 64, device=device, dtype=dtype)
+        k, v = kv[:, :, :1].transpose(1, 2), kv[:, :, 1:2].transpose(1, 2)
+        self._assert_falls_back(q, k, v, "exceeds 2**31 - 2 bytes")
 
     @requires_gluon_template
     @dtypes(torch.bfloat16)
