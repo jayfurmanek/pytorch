@@ -518,6 +518,7 @@ def flex_attention(
     use_gluon = backend == "GLUON" or (
         backend == "AUTO" and config.max_autotune and config.max_autotune_flex_gluon
     )
+    gluon_choices: list[Any] = []
     if use_gluon:
         from .flex_gluon import (
             append_gluon_flex_choices,
@@ -525,7 +526,6 @@ def flex_attention(
             warn_gluon_fallback,
         )
 
-        gluon_choices: list[Any] = []
         reason = append_gluon_flex_choices(
             gluon_choices,
             query,
@@ -551,24 +551,24 @@ def flex_attention(
             mutated_inputs=[logsumexp, max_scores],
             call_sizes=query.get_size(),
         )
-        if backend == "AUTO":
-            # Gluon competes with the Triton choices built below; a Gluon choice
-            # that fails to compile simply loses autotuning.
-            choices.extend(gluon_choices)
-        elif reason is not None:
-            warn_gluon_fallback(reason)
-        else:
-            gluon_out = select_gluon_flex_choice(gluon_choices, layout, input_gen_fns)
-            if gluon_out is not None:
-                return _finalize_flex_forward(
-                    gluon_out,
-                    logsumexp,
-                    max_scores,
-                    subgraph_buffer,
-                    mask_graph_buffer,
-                    score_mod_other_buffers,
-                    mask_mod_other_buffers,
+        if backend == "GLUON":
+            if reason is not None:
+                warn_gluon_fallback(reason)
+            else:
+                gluon_out = select_gluon_flex_choice(
+                    gluon_choices, layout, input_gen_fns
                 )
+                if gluon_out is not None:
+                    return _finalize_flex_forward(
+                        gluon_out,
+                        logsumexp,
+                        max_scores,
+                        subgraph_buffer,
+                        mask_graph_buffer,
+                        score_mod_other_buffers,
+                        mask_mod_other_buffers,
+                    )
+            gluon_choices = []
 
     for conf in configs:
         cur_kernel_options = original_kernel_options.copy()
@@ -723,6 +723,11 @@ def flex_attention(
         SPARSE_Q_BLOCK_SIZE,
         SPARSE_KV_BLOCK_SIZE,
     )
+
+    # Under AUTO, Gluon competes with the Triton choices and a Gluon choice that
+    # fails to compile loses autotuning. It goes last because config.deterministic
+    # picks choices[0] without compiling it.
+    choices.extend(gluon_choices)
 
     if not choices and invalid_block_options is not None:
         raise_flex_kernel_options_error(

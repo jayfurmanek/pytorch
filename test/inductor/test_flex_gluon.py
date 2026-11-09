@@ -363,6 +363,28 @@ class TestFlexGluon(InductorTestCase):
 
     @requires_gluon_template
     @dtypes(torch.bfloat16)
+    def test_auto_deterministic_picks_triton(self, device, dtype):
+        # config.deterministic picks the first choice without compiling it, so
+        # a Gluon choice that fails to compile must not be first.
+        q, k, v = self._make_qkv(device, dtype, S_q=256, S_kv=256, D=64)
+        to_gluon = gluon_template.triton_to_gluon
+
+        def broken(code):
+            code = to_gluon(code)
+            return f"{code}\nundefined_name" if "post_mod_scores" in code else code
+
+        with (
+            inductor_config.patch(
+                max_autotune=True, max_autotune_flex_gluon=True, deterministic=True
+            ),
+            mock.patch.object(gluon_template, "triton_to_gluon", broken),
+        ):
+            out, (code, *_) = run_and_get_code(_compile_flex("AUTO"), q, k, v)
+        self.assertNotIn("@gluon.jit", code)
+        self.assertEqual(out, _compile_flex("TRITON")(q, k, v), atol=2e-2, rtol=2e-2)
+
+    @requires_gluon_template
+    @dtypes(torch.bfloat16)
     @parametrize("case", ["relu", "cos", "compile_failure"])
     def test_epilogue_fusion(self, device, dtype, case):
         # Cheap epilogues fuse; costly ops, and fused kernels that fail to
