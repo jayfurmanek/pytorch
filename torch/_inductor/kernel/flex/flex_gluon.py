@@ -84,7 +84,9 @@ GLUON_FLEX_FWD_TEMPLATES: dict[str, GluonFlexTemplateSpec] = {
     "gfx950": _GFX950_SPEC,
 }
 
-_INT32_MAX = 2**31 - 1
+# AMD buffer ops take 32-bit byte offsets into a buffer of 2**31 - 2 bytes;
+# accesses past it read 0 instead of faulting.
+_BUFFER_OP_MAX_BYTES = 2**31 - 2
 # Layouts are derived from these, so a user-forced value must match a config.
 _FORCEABLE_OPTIONS = ("BLOCK_M", "BLOCK_N", "num_warps")
 
@@ -94,12 +96,13 @@ def _matches_forced_options(conf: GluonFlexConfig, options: dict[str, Any]) -> b
     return all(options.get(k, v) == v for k, v in zip(_FORCEABLE_OPTIONS, values))
 
 
-def _offsets_fit_int32(node) -> bool:
-    # Buffer ops address one (batch, head) slice with 32-bit offsets.
+def _fits_buffer_ops(node) -> bool:
+    # Buffer ops address one (batch, head) slice from its base pointer.
     _, _, seq_len, head_dim = node.get_size()
     _, _, stride_seq, stride_d = node.get_stride()
-    extent = (seq_len - 1) * stride_seq + (head_dim - 1) * stride_d
-    return V.graph.sizevars.guard_or_false(sympy.Le(extent, _INT32_MAX))
+    num_elems = (seq_len - 1) * stride_seq + (head_dim - 1) * stride_d + 1
+    num_bytes = num_elems * node.get_dtype().itemsize
+    return V.graph.sizevars.guard_or_false(sympy.Le(num_bytes, _BUFFER_OP_MAX_BYTES))
 
 
 def _num_programs(spec: GluonFlexTemplateSpec, conf: GluonFlexConfig) -> int:
@@ -133,8 +136,8 @@ def _get_gluon_spec(
         for n in (query, key, value)
     ):
         return None, "the head dim of Q, K and V must be contiguous"
-    if not all(_offsets_fit_int32(n) for n in (query, key, value)):
-        return None, "a (batch, head) slice of Q, K or V exceeds 32-bit offsets"
+    if not all(_fits_buffer_ops(n) for n in (query, key, value)):
+        return None, "a (batch, head) slice of Q, K or V exceeds 2**31 - 2 bytes"
     num_programs = min(_num_programs(spec, c) for c in spec.configs)
     if not sizevars.guard_or_false(sympy.Le(query.get_size()[1], num_programs)):
         return None, f"more query heads than the {num_programs} persistent programs"
