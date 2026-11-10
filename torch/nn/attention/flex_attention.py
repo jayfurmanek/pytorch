@@ -307,8 +307,9 @@ class FlexKernelOptions(TypedDict, total=False):
     """ROCm-specific waves per execution unit."""
 
     NUM_XCDS: NotRequired[int]
-    """Number of XCDs that the Triton forward kernel remaps its programs across,
-    so that the query blocks of one (batch, head) share an XCD's L2. Defaults to
+    """Number of XCDs that the Triton forward and backward kernels remap their
+    programs across, so that the blocks of one (batch, head) share an XCD's L2.
+    Use the fwd_/bwd_ prefixes to set it for one direction. Defaults to
     the device's XCD count on supported ROCm GPUs (currently gfx950); 0
     disables the remap."""
 

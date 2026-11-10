@@ -5586,6 +5586,37 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
+    def test_xcd_remap_backward(self, device):
+        # With GQA 2, 2 * (2 * cdiv(400, BLOCK_M2) + cdiv(272, BLOCK_N1))
+        # programs is not a multiple of 3 for any block sizes in 16..128.
+        q = torch.randn(2, 2, 400, 64, device=device, requires_grad=True)
+        k, v = (
+            torch.randn(2, 1, 272, 64, device=device, requires_grad=True)
+            for _ in range(2)
+        )
+        block_mask = create_block_mask(
+            lambda b, h, q, kv: q >= kv, None, None, 400, 272, device=device
+        )
+
+        def run(num_xcds):
+            compiled = torch.compile(flex_attention, fullgraph=True)
+            options = {"NUM_XCDS": num_xcds}
+
+            def fwd_bwd():
+                kwargs = {"enable_gqa": True, "kernel_options": options}
+                out = compiled(q, k, v, block_mask=block_mask, **kwargs)
+                return torch.autograd.grad(out.sum(), (q, k, v))
+
+            return run_and_get_code(fwd_bwd)
+
+        grads, code = run(3)
+        FileCheck().check("NUM_XCDS : tl.constexpr = 3").run(code[-1])
+        ref, code = run(0)
+        FileCheck().check_not("NUM_XCDS : tl.constexpr").run("\n".join(code))
+        self.assertEqual(grads, ref)
+
+    @supported_platform
+    @skip_on_cpu
     @skip_on_mps
     @skip_on_xpu
     def test_backward_kernel_options_filtering(self, device):

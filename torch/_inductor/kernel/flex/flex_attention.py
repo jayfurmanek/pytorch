@@ -789,13 +789,13 @@ def flex_attention_backward_grid(
     Currently this is only parallelizing over batch* kv_heads, but we can, and want to
     parallelize over ceil_div(q_heads//kv_heads * num_key_value, key_value_block_size).
     To do this will either require atomic updates to some grad values or to have a two pass kernel design.
+    With NUM_XCDS the grid is flattened so the kernel can remap programs across XCDs.
     """
-    return (
-        cdiv(num_queries, meta["BLOCK_M2"]) * (q_heads // kv_heads)
-        + cdiv(num_key_value, meta["BLOCK_N1"]),
-        batch_size,
-        kv_heads,
-    )
+    q_pids = cdiv(num_queries, meta["BLOCK_M2"]) * (q_heads // kv_heads)
+    num_pids = q_pids + cdiv(num_key_value, meta["BLOCK_N1"])
+    if "NUM_XCDS" in meta:
+        return (num_pids * batch_size * kv_heads, 1, 1)
+    return (num_pids, batch_size, kv_heads)
 
 
 flex_attention_backward_template = TritonTemplate(
@@ -1267,6 +1267,7 @@ def flex_attention_backward(*args, **kwargs):
     invalid_block_options: dict[str, Any] | None = None
 
     original_kernel_options = kernel_options.copy()
+    default_num_xcds = _default_num_xcds(query.get_device())
     bwd_input_nodes = [
         query,
         key,
@@ -1378,6 +1379,14 @@ def flex_attention_backward(*args, **kwargs):
         for attrib in ["kpack", "matrix_instr_nonkdim", "waves_per_eu"]:
             if hasattr(conf, attrib):
                 cur_kernel_options[attrib] = getattr(conf, attrib)
+
+        # Same HIP grid-size limit as the forward.
+        num_xcds = cur_kernel_options.pop("NUM_XCDS", default_num_xcds)
+        q_pids = CeilDiv(seq_len_q, cur_kernel_options["BLOCK_M2"]) * (Hq // Hkv)
+        num_pids = q_pids + CeilDiv(seq_len_kv, cur_kernel_options["BLOCK_N1"])
+        work_items = num_pids * Bq * Hkv * cur_kernel_options["num_warps"] * 64
+        if num_xcds and V.graph.sizevars.statically_known_leq(work_items, 2**32 - 1):
+            cur_kernel_options["NUM_XCDS"] = num_xcds
 
         flex_attention_backward_template.maybe_append_choice(
             choices=choices,
