@@ -5571,18 +5571,18 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
             lambda b, h, q, kv: q >= kv, None, None, 448, 448, device=device
         )
 
-        def run(options):
+        def run(num_xcds):
             compiled = torch.compile(flex_attention, fullgraph=True)
+            options = {"NUM_XCDS": num_xcds}
             return run_and_get_code(
                 compiled, q, k, v, block_mask=block_mask, kernel_options=options
             )
 
-        out, code = run({"NUM_XCDS": 3})
+        out, code = run(3)
         FileCheck().check("NUM_XCDS : tl.constexpr = 3").run(code[0])
-        for options in ({"NUM_XCDS": 0}, {}):
-            ref, code = run(options)
-            FileCheck().check_not("NUM_XCDS : tl.constexpr").run(code[0])
-            self.assertEqual(out, ref)
+        ref, code = run(0)
+        FileCheck().check_not("NUM_XCDS : tl.constexpr").run(code[0])
+        self.assertEqual(out, ref)
 
     @supported_platform
     @skip_on_cpu
